@@ -18,7 +18,7 @@
  *     в полном качестве, при старте включается ночной режим
  *  5) "Отправить кадр в ИИ" — один кадр в лучшем качестве уходит на
  *     бэкенд-сервер (/api/photo), ответ показывается на странице
- *  6) Серийная съёмка: до BURST_MAX_PHOTOS (4) кадров в лучшем качестве
+ *  6) Серийная съёмка: до BURST_MAX_PHOTOS (10) кадров в лучшем качестве
  *     накапливаются в памяти (кнопкой на странице ИЛИ физической кнопкой
  *     на плате), затем отправляются все разом на /api/photos
  *  7) Зеркалирование: независимые переключатели "по горизонтали" и
@@ -55,16 +55,11 @@
 #include "FS.h"
 #include "SD_MMC.h"
 #include "time.h"
+#include "config.h"
 
 // ============================ CONFIG ================================
 
-const char* WIFI_SSID     = "your_wifi_ssid";
-const char* WIFI_PASSWORD = "your_wifi_password";
-
-// Адрес твоего бэкенд-сервера (тот самый Flask на VPS)
-const char* BACKEND_HOST      = "your_server_ip";  // IP или домен твоего VPS
-const int   BACKEND_PORT      = 8080;          // порт, на котором слушает бэкенд
-const char* BACKEND_DEVICE_KEY = "your_device_key";     // тот же DEVICE_KEY, что в .env бэкенда
+// Credentials are now in config.h — see config.example.h for template
 
 // Разрешение/качество для КАЧЕСТВЕННЫХ снимков (запись, таймлапс, отправка в ИИ)
 // FRAMESIZE_ варианты: FRAMESIZE_QVGA(320x240), FRAMESIZE_VGA(640x480),
@@ -78,7 +73,7 @@ const char* BACKEND_DEVICE_KEY = "your_device_key";     // тот же DEVICE_KE
 #define PREVIEW_JPEG_QUALITY 25
 
 // Сколько кадров максимум можно накопить в "серию" перед отправкой всех разом в ИИ
-#define BURST_MAX_PHOTOS 4
+#define BURST_MAX_PHOTOS 10
 
 // Физическая кнопка спуска затвора.
 // GPIO13 выбран как безопасный: не занят камерой, SD-картой (в 1-битном режиме)
@@ -86,6 +81,8 @@ const char* BACKEND_DEVICE_KEY = "your_device_key";     // тот же DEVICE_KE
 // Подключение: между GPIO13 и GND, используется внутренняя подтяжка (INPUT_PULLUP).
 #define SHUTTER_BUTTON_PIN 13
 #define BUTTON_DEBOUNCE_MS 300
+#define BUTTON_LONG_PRESS_MS 1500
+#define FLASH_LED_PIN 4
 
 // Целевой интервал между кадрами при записи "видео" (кадр-последовательности)
 // SD-карта на 1-битном режиме ESP32-CAM не очень быстрая, поэтому не гонимся
@@ -142,6 +139,9 @@ size_t   burstLen[BURST_MAX_PHOTOS];
 int burstCount = 0;
 
 unsigned long lastButtonPressMs = 0;
+static bool buttonWasPressed = false;
+static unsigned long pressTime = 0;
+static bool longPressHandled = false;
 
 // Зеркалирование изображения — независимые переключатели.
 // hmirror = отражение по горизонтали (влево-вправо), vflip = по вертикали (вверх-вниз).
@@ -625,6 +625,8 @@ void setup() {
   Serial.setDebugOutput(false);
 
   pinMode(SHUTTER_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
 
   if (!initCamera()) {
     Serial.println("Камера не инициализирована, остановка");
@@ -680,12 +682,44 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Физическая кнопка спуска: каждое короткое нажатие добавляет один кадр в серию
-  if (digitalRead(SHUTTER_BUTTON_PIN) == LOW) {
-    if (now - lastButtonPressMs > BUTTON_DEBOUNCE_MS) {
-      lastButtonPressMs = now;
+  // Физическая кнопка: короткое нажатие = фото в серию, длинное удержание = отправка
+  bool buttonIsPressed = (digitalRead(SHUTTER_BUTTON_PIN) == LOW);
+
+  // Falling edge — кнопка нажата
+  if (buttonIsPressed && !buttonWasPressed) {
+    buttonWasPressed = true;
+    pressTime = now;
+    longPressHandled = false;
+  }
+
+  // Rising edge — кнопка отпущена
+  if (!buttonIsPressed && buttonWasPressed) {
+    buttonWasPressed = false;
+    unsigned long pressDuration = now - pressTime;
+    if (pressDuration >= BUTTON_DEBOUNCE_MS && pressDuration < BUTTON_LONG_PRESS_MS) {
+      // Короткое нажатие: фото в серию
       if (captureIntoBurst()) {
         Serial.println("Кнопка: кадр добавлен в серию (" + String(burstCount) + "/" + String(BURST_MAX_PHOTOS) + ")");
+      }
+      // Мигнуть вспышкой 1 раз
+      digitalWrite(FLASH_LED_PIN, HIGH); delay(50); digitalWrite(FLASH_LED_PIN, LOW);
+    }
+  }
+
+  // Длинное удержание — отправка серии
+  if (buttonIsPressed && buttonWasPressed && !longPressHandled && (now - pressTime >= BUTTON_LONG_PRESS_MS)) {
+    longPressHandled = true;
+    if (burstCount == 0) {
+      // Буфер пуст: мигнуть вспышкой 1× коротко
+      for (int i=0; i<1; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
+    } else {
+      String result = sendBurstToBackend();
+      if (result.indexOf("error") >= 0) {
+        // Ошибка: мигнуть вспышкой 2×
+        for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
+      } else {
+        // Успех: мигнуть вспышкой 3×
+        for (int i=0; i<3; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
       }
     }
   }

@@ -8,7 +8,7 @@
       "plan_name": "workflow-integration",
       "status": "active",
       "started_at": "2026-07-26T18:55:20.876Z",
-      "updated_at": "2026-07-26T19:05:20.786Z",
+      "updated_at": "2026-07-26T19:07:48.654Z",
       "session_ids": [
         "opencode:ses_06059418dffeu7mMoFFZXALcBe",
         "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
@@ -46,6 +46,32 @@
           "status": "completed",
           "ended_at": "2026-07-26T19:05:20.201Z",
           "elapsed_ms": 14731
+        },
+        "todo:4": {
+          "task_key": "todo:4",
+          "task_label": "4",
+          "task_title": "microReader: расширить struct settings — добавить поля backendHost, backendPort, deviceKey",
+          "session_id": "opencode:ses_0602dfd01ffeXAnQI3cBR9QSgM",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-07-26T19:07:48.654Z",
+          "started_at": "2026-07-26T19:06:26.847Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:07:48.654Z",
+          "elapsed_ms": 81807
+        },
+        "todo:2": {
+          "task_key": "todo:2",
+          "task_label": "2",
+          "task_title": "ESP32-CAM: вынести credentials в config.h + config.example.h",
+          "session_id": "opencode:ses_0602e1749ffePQRVnydoZo2i9h",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-07-26T19:07:47.402Z",
+          "started_at": "2026-07-26T19:07:26.312Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:07:47.402Z",
+          "elapsed_ms": 21090
         }
       }
     }
@@ -53,7 +79,7 @@
   "active_plan": "G:\\Projects\\Endpoint-vps-esp32\\.omo\\plans\\workflow-integration.md",
   "started_at": "2026-07-26T18:55:20.876Z",
   "status": "active",
-  "updated_at": "2026-07-26T19:05:20.786Z",
+  "updated_at": "2026-07-26T19:07:48.654Z",
   "session_ids": [
     "opencode:ses_06059418dffeu7mMoFFZXALcBe",
     "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
@@ -91,6 +117,32 @@
       "status": "completed",
       "ended_at": "2026-07-26T19:05:20.201Z",
       "elapsed_ms": 14731
+    },
+    "todo:4": {
+      "task_key": "todo:4",
+      "task_label": "4",
+      "task_title": "microReader: расширить struct settings — добавить поля backendHost, backendPort, deviceKey",
+      "session_id": "opencode:ses_0602dfd01ffeXAnQI3cBR9QSgM",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-07-26T19:07:48.654Z",
+      "started_at": "2026-07-26T19:06:26.847Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:07:48.654Z",
+      "elapsed_ms": 81807
+    },
+    "todo:2": {
+      "task_key": "todo:2",
+      "task_label": "2",
+      "task_title": "ESP32-CAM: вынести credentials в config.h + config.example.h",
+      "session_id": "opencode:ses_0602e1749ffePQRVnydoZo2i9h",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-07-26T19:07:47.402Z",
+      "started_at": "2026-07-26T19:07:26.312Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:07:47.402Z",
+      "elapsed_ms": 21090
     }
   },
   "agent": "atlas"

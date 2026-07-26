@@ -76,6 +76,9 @@ struct {                                // Структура со всеми н
   uint16_t dinoBestScore = 0;           // Счёт динозавра
   uint16_t tetrBestScore = 0;           // Счёт тетриса
   uint16_t snakeBestScore = 0;          // Счёт змейки
+  char backendHost[64] = "";   // хост бэкенд-сервера
+  uint16_t backendPort = 0;     // порт бэкенд-сервера
+  char deviceKey[64] = "";      // X-Device-Key
 } sets;
 FileData data(&LittleFS, "/data.dat", EE_KEY, &sets, sizeof(sets));  // замена епрома
 #define SEGMENT (sets.tetrisSegment)
@@ -130,7 +133,12 @@ void setup() {
   } else {                         // Если ключ совпадает
     EEPROM.get(1, sets);           // Читаем настройки
   }*/
+  // ВНИМАНИЕ: при изменении размера struct FileData перезаписывает data.dat
+  // Поэтому addWithoutWipe(true) сохраняет старые поля и дописывает новые со значениями по умолчанию
+  data.addWithoutWipe(true);
   data.read();  // это заменяет то, что выше
+  // Если размер struct меняется снова, снова добавь addWithoutWipe(true) перед read()
+  // После того как все устройства прошиты новой версией, эту строку можно убрать
 
   while (!oled.init(IIC_SDA_PIN, IIC_SCL_PIN)) {  // Инициализация оледа
     digitalWrite(LED_BUILTIN, LOW);               // Медленно мигаем пока не проинициализируем олед

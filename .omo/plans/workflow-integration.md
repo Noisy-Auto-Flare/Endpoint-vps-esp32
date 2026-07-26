@@ -90,7 +90,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/1-restructure/
   Commit: Y | feat(repo): reorganize into monorepo with esp32-cam/ and microreader/
 
-- [ ] 2. ESP32-CAM: вынести credentials в config.h + config.example.h
+- [x] 2. ESP32-CAM: вынести credentials в config.h + config.example.h
   What to do / Must NOT do:
     - Создать `esp32-cam/ESP32_CAM_recorder/config.h` с реальными значениями пользователя (WIFI_SSID, WIFI_PASSWORD, BACKEND_HOST, BACKEND_PORT, BACKEND_DEVICE_KEY)
     - Создать `esp32-cam/ESP32_CAM_recorder/config.example.h` с ПЛЕЙСХОЛДЕРАМИ (пустые строки или "your_ssid_here")
@@ -116,7 +116,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/2-config-h/
   Commit: Y | feat(esp32-cam): extract credentials to config.h + config.example.h
 
-- [ ] 3. ESP32-CAM: BURST_MAX_PHOTOS 4→10 + long-press button + LED flash
+- [x] 3. ESP32-CAM: BURST_MAX_PHOTOS 4→10 + long-press button + LED flash
   What to do / Must NOT do:
     - В ESP32_CAM_recorder.ino:
       a) Поменять `#define BURST_MAX_PHOTOS 4` на `#define BURST_MAX_PHOTOS 10` (строка 81)
@@ -185,7 +185,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/3-button-burst/
   Commit: Y | feat(esp32-cam): burst 10 photos, long-press button send, LED flash feedback
 
-- [ ] 4. microReader: расширить struct settings — добавить поля backendHost, backendPort, deviceKey
+- [x] 4. microReader: расширить struct settings — добавить поля backendHost, backendPort, deviceKey
   What to do / Must NOT do:
     - В `microreader/firmware/a-microReader-v1.2.ino`:
       - Добавить в struct settings (после snakeBestScore) поля:
