@@ -145,6 +145,33 @@ def handle_photo():
 
 
 # ---------------------------------------------------------------------
+# POST /api/photos — принимает СЕРИЮ фото: JSON {"images": ["<base64_1>", ...]}
+# ---------------------------------------------------------------------
+@app.route("/api/photos", methods=["POST"])
+def handle_photos():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not payload or not isinstance(payload.get("images"), list) or not payload["images"]:
+        return jsonify({"error": 'expected JSON body: {"images": ["<base64>", ...]}'}), 400
+
+    images_b64 = payload["images"]
+
+    parts = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
+    for img_b64 in images_b64:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
+
+    try:
+        answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
+    except (requests.RequestException, RuntimeError) as e:
+        return jsonify({"error": f"gemini request failed: {e}"}), 502
+
+    set_latest_result(answer, source="photos_burst")
+    return jsonify({"ok": True, "text": answer})
+
+
+# ---------------------------------------------------------------------
 # POST /api/voice — принимает WAV (сырые байты в теле запроса)
 # ---------------------------------------------------------------------
 @app.route("/api/voice", methods=["POST"])
