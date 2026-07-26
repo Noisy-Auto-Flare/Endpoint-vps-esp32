@@ -270,7 +270,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/6-main-hook/
   Commit: Y | feat(microreader): add down.hold() handler for answer polling
 
-- [ ] 7. microReader: network.ino — HTTP GET /api/latest + сохранение ответа
+- [x] 7. microReader: network.ino — HTTP GET /api/latest + сохранение ответа
   What to do / Must NOT do:
     - Создать `microreader/firmware/network.ino` с функцией:
       ```cpp
