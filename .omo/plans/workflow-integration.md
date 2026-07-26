@@ -468,7 +468,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/8-gitignore/
   Commit: Y | chore: add gitignore rules for credentials and build artifacts
 
-- [ ] 9. README.md — полная документация системы
+- [x] 9. README.md — полная документация системы
   What to do / Must NOT do:
     - Переписать корневой README.md, включив:
       - **Архитектура**: схема взаимодействия ESP32-CAM → Backend (Gemini) → microReader
