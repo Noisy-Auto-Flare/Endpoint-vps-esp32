@@ -8,7 +8,7 @@
       "plan_name": "workflow-integration",
       "status": "active",
       "started_at": "2026-07-26T18:55:20.876Z",
-      "updated_at": "2026-07-26T19:07:48.654Z",
+      "updated_at": "2026-07-26T19:10:28.814Z",
       "session_ids": [
         "opencode:ses_06059418dffeu7mMoFFZXALcBe",
         "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
@@ -72,6 +72,32 @@
           "status": "completed",
           "ended_at": "2026-07-26T19:07:47.402Z",
           "elapsed_ms": 21090
+        },
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "microReader: portal.ino — добавить блок \"Сервер\" для настройки бэкенда",
+          "session_id": "opencode:ses_0602bdbbbffeiSUaCYji3k5o65",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-07-26T19:10:28.246Z",
+          "started_at": "2026-07-26T19:08:41.357Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:10:28.246Z",
+          "elapsed_ms": 106889
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "microReader: main.ino — добавить down.hold() → enterToGetAnswerMode()",
+          "session_id": "opencode:ses_0602bbfc3ffeg9ZxTyAGFsDvgS",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-07-26T19:10:28.814Z",
+          "started_at": "2026-07-26T19:10:04.131Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:10:28.814Z",
+          "elapsed_ms": 24683
         }
       }
     }
@@ -79,7 +105,7 @@
   "active_plan": "G:\\Projects\\Endpoint-vps-esp32\\.omo\\plans\\workflow-integration.md",
   "started_at": "2026-07-26T18:55:20.876Z",
   "status": "active",
-  "updated_at": "2026-07-26T19:07:48.654Z",
+  "updated_at": "2026-07-26T19:10:28.814Z",
   "session_ids": [
     "opencode:ses_06059418dffeu7mMoFFZXALcBe",
     "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
@@ -143,6 +169,32 @@
       "status": "completed",
       "ended_at": "2026-07-26T19:07:47.402Z",
       "elapsed_ms": 21090
+    },
+    "todo:5": {
+      "task_key": "todo:5",
+      "task_label": "5",
+      "task_title": "microReader: portal.ino — добавить блок \"Сервер\" для настройки бэкенда",
+      "session_id": "opencode:ses_0602bdbbbffeiSUaCYji3k5o65",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-07-26T19:10:28.246Z",
+      "started_at": "2026-07-26T19:08:41.357Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:10:28.246Z",
+      "elapsed_ms": 106889
+    },
+    "todo:6": {
+      "task_key": "todo:6",
+      "task_label": "6",
+      "task_title": "microReader: main.ino — добавить down.hold() → enterToGetAnswerMode()",
+      "session_id": "opencode:ses_0602bbfc3ffeg9ZxTyAGFsDvgS",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-07-26T19:10:28.814Z",
+      "started_at": "2026-07-26T19:10:04.131Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:10:28.814Z",
+      "elapsed_ms": 24683
     }
   },
   "agent": "atlas"

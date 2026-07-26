@@ -209,7 +209,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/4-struct-ext/
   Commit: Y | feat(microreader): add backend config fields to settings struct
 
-- [ ] 5. microReader: portal.ino — добавить блок "Сервер" для настройки бэкенда
+- [x] 5. microReader: portal.ino — добавить блок "Сервер" для настройки бэкенда
   What to do / Must NOT do:
     - В `microreader/firmware/portal.ino` в функцию `build()`:
       - Добавить новый M_BLOCK_TAB после блока "Другое":
@@ -245,7 +245,7 @@ Your next move: утвердить план, затем запустить `/sta
   Evidence: .omo/evidence/5-portal/
   Commit: Y | feat(microreader): add backend config block to web portal
 
-- [ ] 6. microReader: main.ino — добавить down.hold() → enterToGetAnswerMode()
+- [x] 6. microReader: main.ino — добавить down.hold() → enterToGetAnswerMode()
   What to do / Must NOT do:
     - В `microreader/firmware/a-microReader-v1.2.ino`:
       a) После `#include <GyverTimer.h>` добавить:

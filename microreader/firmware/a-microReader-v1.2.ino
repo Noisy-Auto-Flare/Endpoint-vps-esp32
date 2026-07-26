@@ -51,6 +51,8 @@
 #include <EncButton.h>      // Либа кнопок
 #include <TJpg_Decoder.h>   // Либа jpg'а
 #include <GyverTimer.h>     // Либа таймера
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
 
 /* =========================================== */
 /* ============ Список объектов ============== */
@@ -100,6 +102,7 @@ uint8_t WIDTH = (64/SEGMENT - 16/SEGMENT);          // -1 (для текста) 
 uint8_t HEIGHT = (128/SEGMENT);                     // и высота
 /* =========================================== */
 
+void enterToGetAnswerMode();
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);         // Лед на модуле как выход
@@ -163,6 +166,7 @@ void setup() {
     up = Button(DWN_BTN_PIN);
     down = Button(UP_BTN_PIN);
   }
+  down.setHoldTimeout(1500);
   oled.clear();              // Очистка оледа
   oled.update();             // Вывод пустой картинки
   oled.autoPrintln(true);    // Включаем автоперенос строки
@@ -217,6 +221,11 @@ void loop() {
     //dinosaurGame();
     //tetrisGame();
     enterToGameMode();
+  }
+
+  if (down.hold()) {
+    uiTimer = millis();
+    enterToGetAnswerMode();
   }
 
   if (millis() - uiTimer >= 5000) {  // Каждые 5 сек принудительно обновляем дисп. ради индикации заряда

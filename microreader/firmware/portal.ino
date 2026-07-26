@@ -23,7 +23,15 @@ void build() {                     // Билд страницы
       "Другое",             // Имя + тип DIV
       M_BOX(GP_CENTER, GP.LABEL("Режим левши"); GP.SWITCH("leftEn", sets.leftmode);); GP.BREAK();
       M_BOX(GP_CENTER, GP.LABEL("Размер сегмента игр"); GP.NUMBER("tetrSeg", "", sets.tetrisSegment);); GP.BREAK(); // размер сегмента
-      M_BOX(GP_CENTER, GP.LABEL("Яркость"); GP.SLIDER("con", sets.dispContrast, 10, 100););););
+      M_BOX(GP_CENTER, GP.LABEL("Яркость"); GP.SLIDER("con", sets.dispContrast, 10, 100);););
+    M_BLOCK_TAB(
+      "Сервер",
+      GP.TEXT("backendHost", "Хост бэкенда", sets.backendHost, "", 63);
+      GP.BREAK();
+      GP.NUMBER("backendPort", "Порт", (int)sets.backendPort);
+      GP.BREAK();
+      GP.TEXT("deviceKey", "Ключ устройства", sets.deviceKey, "", 63);
+    );
   GP.FORM_END();                 // <- Конец формы (костыль)
   M_BLOCK_TAB(                   // Блок с OTA-апдейтом
     "Обновление прошивки",       // Имя + тип DIV
@@ -50,6 +58,9 @@ void action(GyverPortal& p) {      // Подсос значений со стр�
     oled.setContrast(con);            // Тут же задаем яркость оледа
     uint8_t tmp_tseg;
     p.copyInt("tetrSeg", tmp_tseg);
+    p.copyStr("backendHost", sets.backendHost);
+    p.copyInt("backendPort", (int&)sets.backendPort);
+    p.copyStr("deviceKey", sets.deviceKey);
     if (tmp_tseg != sets.tetrisSegment) {      // если поменяли
       sets.tetrisSegment = tmp_tseg;           // записать
       WIDTH = 64 / tmp_tseg - 16 / tmp_tseg;   // новая ширина
