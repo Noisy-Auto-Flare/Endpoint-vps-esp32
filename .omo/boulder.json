@@ -1,0 +1,97 @@
+{
+  "schema_version": 2,
+  "active_work_id": "workflow-integration-48742d0a",
+  "works": {
+    "workflow-integration-48742d0a": {
+      "work_id": "workflow-integration-48742d0a",
+      "active_plan": "G:\\Projects\\Endpoint-vps-esp32\\.omo\\plans\\workflow-integration.md",
+      "plan_name": "workflow-integration",
+      "status": "active",
+      "started_at": "2026-07-26T18:55:20.876Z",
+      "updated_at": "2026-07-26T19:05:20.786Z",
+      "session_ids": [
+        "opencode:ses_06059418dffeu7mMoFFZXALcBe",
+        "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
+        "opencode:ses_06032f79dffeQUz1WG1lxRfYnB"
+      ],
+      "session_origins": {
+        "opencode:ses_06059418dffeu7mMoFFZXALcBe": "direct",
+        "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ": "direct",
+        "opencode:ses_06032f79dffeQUz1WG1lxRfYnB": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:8": {
+          "task_key": "todo:8",
+          "task_label": "8",
+          "task_title": "Создать .gitignore (файла пока нет, нужно создать с нуля)",
+          "session_id": "opencode:ses_060321857ffeNvjVv6xCWzfZNh",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-07-26T19:05:20.786Z",
+          "started_at": "2026-07-26T19:05:03.797Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:05:20.786Z",
+          "elapsed_ms": 16989
+        },
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "Реструктурировать репозиторий — создать папки esp32-cam/ и microreader/ + скопировать файлы прошивок",
+          "session_id": "opencode:ses_060322367ffeLzp8zE29Rn3DAo",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-07-26T19:05:20.201Z",
+          "started_at": "2026-07-26T19:05:05.470Z",
+          "status": "completed",
+          "ended_at": "2026-07-26T19:05:20.201Z",
+          "elapsed_ms": 14731
+        }
+      }
+    }
+  },
+  "active_plan": "G:\\Projects\\Endpoint-vps-esp32\\.omo\\plans\\workflow-integration.md",
+  "started_at": "2026-07-26T18:55:20.876Z",
+  "status": "active",
+  "updated_at": "2026-07-26T19:05:20.786Z",
+  "session_ids": [
+    "opencode:ses_06059418dffeu7mMoFFZXALcBe",
+    "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ",
+    "opencode:ses_06032f79dffeQUz1WG1lxRfYnB"
+  ],
+  "session_origins": {
+    "opencode:ses_06059418dffeu7mMoFFZXALcBe": "direct",
+    "opencode:ses_06036f002ffe0ujjOwXHlW1xCZ": "direct",
+    "opencode:ses_06032f79dffeQUz1WG1lxRfYnB": "direct"
+  },
+  "plan_name": "workflow-integration",
+  "task_sessions": {
+    "todo:8": {
+      "task_key": "todo:8",
+      "task_label": "8",
+      "task_title": "Создать .gitignore (файла пока нет, нужно создать с нуля)",
+      "session_id": "opencode:ses_060321857ffeNvjVv6xCWzfZNh",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-07-26T19:05:20.786Z",
+      "started_at": "2026-07-26T19:05:03.797Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:05:20.786Z",
+      "elapsed_ms": 16989
+    },
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "Реструктурировать репозиторий — создать папки esp32-cam/ и microreader/ + скопировать файлы прошивок",
+      "session_id": "opencode:ses_060322367ffeLzp8zE29Rn3DAo",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-07-26T19:05:20.201Z",
+      "started_at": "2026-07-26T19:05:05.470Z",
+      "status": "completed",
+      "ended_at": "2026-07-26T19:05:20.201Z",
+      "elapsed_ms": 14731
+    }
+  },
+  "agent": "atlas"
+}
