@@ -22,20 +22,19 @@
 │       └── config.example.h        # Шаблон config.h
 ├── microreader/
 │   └── firmware/
-│       ├── a-microReader-v1.2.ino  # Главный файл прошивки microReader
-│       ├── network.ino             # HTTP-опрос бэкенда
-│       ├── portal.ino              # Веб-портал конфигурации
-│       ├── wifi.ino                # WiFi-менеджмент
-│       ├── ui.ino                  # Интерфейс OLED
-│       ├── files.ino               # Файловый менеджер
-│       ├── gamemode.ino            # Меню игр
-│       ├── dinosaurGame.ino        # Игра "динозавр"
-│       ├── tetrisGame.ino          # Игра "тетрис"
-│       ├── snakeGame.ino           # Игра "змейка"
-│       ├── calcul.ino              # Калькулятор
-│       ├── servmode.ino            # Сервисный режим
-│       └── ...
-├── microReader-repo/               # Оригинальный репозиторий microReader
+│       └── a-microReader-v1.2/     # Все файлы прошивки microReader (в одной папке для Arduino IDE)
+│           ├── a-microReader-v1.2.ino  # Главный файл прошивки
+│           ├── network.ino         # HTTP-опрос бэкенда (ответ по удержанию кнопки ВНИЗ)
+│           ├── portal.ino          # Веб-портал конфигурации (вкладка "Сервер")
+│           ├── wifi.ino            # WiFi-менеджмент
+│           ├── ui.ino              # Интерфейс OLED
+│           ├── files.ino           # Файловый менеджер
+│           ├── gamemode.ino        # Меню игр
+│           ├── dinosaurGame.ino    # Игра "динозавр"
+│           ├── tetrisGame.ino      # Игра "тетрис"
+│           ├── snakeGame.ino       # Игра "змейка"
+│           ├── calcul.ino          # Калькулятор
+│           └── servmode.ino        # Сервисный режим
 ├── .gitignore                      # Игнорируемые файлы
 └── README.md                       # Этот файл
 ```
@@ -174,11 +173,13 @@ sudo systemctl status shpora-backend
 
 ### Прошивка
 
-1. Открой `microreader/firmware/a-microReader-v1.2.ino` в Arduino IDE
+1. Открой `microreader/firmware/a-microReader-v1.2/a-microReader-v1.2.ino` в Arduino IDE
 2. Установи ядро ESP8266 v3.1.2 (или новее)
-3. Скопируй библиотеки из `microReader-repo/libraries/` в свою папку libraries с заменой
+3. Скопируй библиотеки из оригинального репозитория [Nich1con/microReader](https://github.com/Nich1con/microReader) (`libraries/`) в свою папку libraries с заменой
 4. Настройки платы: Generic ESP8266 Module, Flash Size: 4M (FS:2MB OTA:~1019KB)
 5. Залей прошивку
+
+> ⚠️ **Важно**: если файловая система показывает ~64 КБ вместо 2 МБ — прошивка была собрана с неверным `Flash Size`. Перепрошей через USB один раз с `Flash Size: 4M (FS:2MB OTA:~1019KB)` и `Erase Flash: All flash`, чтобы пересоздать разметку. Дальше обновляй через OTA.
 
 ### Настройка
 
@@ -230,7 +231,7 @@ sudo systemctl status shpora-backend
   - ESP32 (для ESP32-CAM): https://espressif.github.io/arduino-esp32/package_esp32_index.json
   - ESP8266 (для microReader): https://arduino.esp8266.com/stable/package_esp8266com_index.json
 - **Python 3.8+** + `requirements.txt` для бэкенда
-- **microReader libraries**: скопировать из `microReader-repo/libraries/` с заменой
+- **microReader libraries**: скопировать из [Nich1con/microReader](https://github.com/Nich1con/microReader) (`libraries/`) с заменой
 
 ## Про смену AI-провайдера
 

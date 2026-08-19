@@ -28,7 +28,8 @@ import os
 import threading
 import time
 
-from flask import Flask, request, jsonify
+import json
+from flask import Flask, request, Response, jsonify
 import requests
 
 # ============================ CONFIG ================================
@@ -215,7 +216,9 @@ def get_latest():
         if _state["ready"]:
             _state["ready"] = False
 
-    return jsonify(result)
+    # Используем json.dumps с ensure_ascii=False для сохранения русского текста
+    response_text = json.dumps(result, ensure_ascii=False)
+    return Response(response_text, mimetype='application/json')
 
 
 # ---------------------------------------------------------------------

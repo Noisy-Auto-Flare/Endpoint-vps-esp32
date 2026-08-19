@@ -32,6 +32,7 @@ void build() {                     // Билд страницы
       GP.BREAK();
       GP.TEXT("deviceKey", "Ключ устройства", sets.deviceKey, "", 63);
     );
+  )                              // Закрываем M_BLOCK
   GP.FORM_END();                 // <- Конец формы (костыль)
   M_BLOCK_TAB(                   // Блок с OTA-апдейтом
     "Обновление прошивки",       // Имя + тип DIV
