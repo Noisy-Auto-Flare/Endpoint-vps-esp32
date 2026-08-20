@@ -216,8 +216,10 @@ def get_latest():
         if _state["ready"]:
             _state["ready"] = False
 
-    # Используем json.dumps с ensure_ascii=False для сохранения русского текста
-    response_text = json.dumps(result, ensure_ascii=False)
+    # Используем json.dumps с ensure_ascii=False для сохранения русского текста.
+    # ВАЖНО: separators=(",", ":") даёт компактный JSON БЕЗ пробелов ({"ready":true,...}),
+    # т.к. прошивка microReader парсит ответ вручную через indexOf и ждёт точный формат.
+    response_text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
 
