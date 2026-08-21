@@ -406,6 +406,7 @@ def handle_voice_chunk():
     set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
     return jsonify({"ok": True, "final": True,
                     "stt": "groq" if stt_used else "gemini_audio",
+                    "transcript": transcript,
                     "text": answer})
 
 

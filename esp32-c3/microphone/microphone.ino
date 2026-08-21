@@ -107,6 +107,34 @@ void IRAM_ATTR buttonISR() {
   }
 }
 
+// ====================== ПАРСИНГ ОТВЕТА ======================
+
+// Достаёт значение строкового поля из JSON-ответа сервера.
+// Простая ручная распаковка (как в microReader): кавычки, \n и \\ понимает.
+String extractJsonStr(const String &json, const char *key) {
+  String pat = String("\"") + key + "\":\"";
+  int start = json.indexOf(pat);
+  if (start < 0) return "";
+  start += pat.length();
+  String out = "";
+  for (int i = start; i < (int)json.length(); i++) {
+    char c = json[i];
+    if (c == '\\') {                    // экранированный символ
+      if (i + 1 < (int)json.length()) {
+        char n = json[++i];
+        if (n == 'n') out += '\n';
+        else if (n == 't') out += '\t';
+        else out += n;                  // \" \\ и прочее -> сам символ
+      }
+    } else if (c == '"') {
+      break;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 // ===================== ОТПРАВКА ЧАНКА =====================
 
 // Отправляет файл /chunk.wav как raw body (не base64) на /api/voice-chunk.
@@ -153,18 +181,50 @@ bool sendChunk(bool isFinal) {
   httpClient.flush();
   f.close();
 
-  // --- Ждём ответ сервера ---
-  unsigned long t = millis();
-  while (httpClient.available() < 12 && millis() - t < 8000) {
-    delay(1);
+  // --- Ждём и читаем ОТВЕТ ЦЕЛИКОМ: сначала HTTP-заголовки, потом JSON ---
+  String body = "";
+  unsigned long lastData = millis();
+  uint8_t rbuf[256];
+  while (millis() - lastData < 6000) {
+    while (httpClient.available()) {
+      int n = httpClient.read(rbuf, sizeof(rbuf));
+      if (n > 0) {
+        body.concat((const char*)rbuf, n);
+        lastData = millis();
+      }
+    }
+    if (!httpClient.connected()) break;   // Connection: close — сервер закрыл
+    delay(10);
   }
-
-  String statusLine = httpClient.readStringUntil('\n');
   httpClient.stop();
 
-  bool ok = statusLine.indexOf(" 200 ") >= 0 || statusLine.indexOf("200") >= 0;
+  // Статус — в первой строке тела ответа: "HTTP/1.1 200 OK"
+  bool ok = body.startsWith("HTTP/1.1 200");
   Serial.printf("Ответ сервера: %s -> %s\n",
-                statusLine.c_str(), ok ? "OK" : "ОШИБКА");
+                ok ? "200" : "?", ok ? "OK" : "ОШИБКА");
+
+  // --- Показываем, ЧТО сервер услышал (для отладки микрофона) ---
+  if (isFinal && ok) {
+    String sttPath    = extractJsonStr(body, "stt");
+    String transcript = extractJsonStr(body, "transcript");
+    String answerText = extractJsonStr(body, "text");
+
+    Serial.println("========================================");
+    Serial.println("Путь распознавания: " +
+                   (sttPath.length() ? sttPath : String("(нет данных)")));
+    Serial.println("--- ЧТО РАСПОЗНАНО ИЗ ЗАПИСИ ---");
+    Serial.println(transcript.length() ? transcript : "(пусто)");
+    if (answerText.length()) {
+      Serial.println("--- ОТВЕТ НЕЙРОНКИ (первые 400 симв.) ---");
+      if (answerText.length() > 400) {
+        Serial.println(answerText.substring(0, 400) + "...");
+      } else {
+        Serial.println(answerText);
+      }
+    }
+    Serial.println("========================================");
+  }
+
   return ok;
 }
 
