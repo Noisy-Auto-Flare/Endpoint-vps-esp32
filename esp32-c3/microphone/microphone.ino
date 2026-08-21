@@ -64,11 +64,9 @@ constexpr size_t RING_SIZE_BYTES = 16384;              // ≈0.5 с звука �
 
 constexpr const char* CHUNK_FILES[2] = { "/chk_a.wav", "/chk_b.wav" };
 
-inline void ledOn()  { digitalWrite(LED_PIN, LOW); }
-inline void ledOff() { digitalWrite(LED_PIN, HIGH); }
-void blinkLed(int times, int onMs, int offMs);
-
 // ============================ СОСТОЯНИЕ ===================================
+// ВАЖНО: типы объявлены ДО любых функций — автопрототипы Arduino IDE
+// вставляются перед первой функцией файла и требуют готовых типов.
 
 enum class BtnCmd : uint8_t { NONE = 0, START = 1, STOP = 2 };
 volatile BtnCmd isrRequest = BtnCmd::NONE;      // пишет только ISR
@@ -87,6 +85,25 @@ static SemaphoreHandle_t   spiffsMutex;   // SPIFFS не потокобезоп�
 volatile bool recordingActive = false;
 
 WiFiClient httpClient;
+
+// ======================= ПРОТОТИПЫ ФУНКЦИЙ ================================
+// Явные прототипы: авто-генерация Arduino IDE ненадёжна
+// для функций с кастомными типами в сигнатуре.
+
+void   blinkLed(int times, int onMs, int offMs);
+String extractJsonStr(const String& json, const char* key);
+void   writeWavHeader(File& f, uint32_t dataSizeBytes);
+bool   openChunkFile(File& f, const char* path);
+void   finalizeChunkFile(File& f, uint32_t pcmBytes);
+void   samplerTask(void* arg);
+bool   readResponseAndReport(bool expectReport);
+bool   sendJob(const UploadJob& job);
+void   IRAM_ATTR buttonISR();
+
+// ============================ LED-ХЕЛПЕРЫ =================================
+
+inline void ledOn()  { digitalWrite(LED_PIN, LOW); }
+inline void ledOff() { digitalWrite(LED_PIN, HIGH); }
 
 // ============================ УТИЛИТЫ =====================================
 
