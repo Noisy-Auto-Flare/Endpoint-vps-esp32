@@ -183,6 +183,8 @@ bool sendChunk(bool isFinal) {
     if (n <= 0) break;
     size_t written = httpClient.write(buf, n);
     totalSent += written;
+    delay(1);   // отдаём слот WiFi-стеку: без этого длинная блокирующая
+                // отправка может уронить lwIP (assert xQueueSemaphoreTake)
     if (written != (size_t)n) {
       Serial.printf("ОШИБКА отправки: записано %u из %d байт (итого %u/%u)\n",
                     (unsigned)written, n, (unsigned)totalSent, (unsigned)fileSize);
