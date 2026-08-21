@@ -14,8 +14,8 @@
  * ПОТОКИ:
  *   - samplerTask: ждёт кнопку СТАРТ, непрерывно читает кадры DMA,
  *     конвертирует в PCM и пишет в WAV-файлы чанками по 5 сек
- *     (ping-pong между двумя файлами). Записал чанк -> в очередь
- *     отправки -> СРАЗУ пишет следующий. Речь не прерывается никогда.
+ *     (уникальное имя на чанк: /c0.wav ... /c5.wav). Записал чанк ->
+ *     в очередь отправки -> СРАЗУ пишет следующий. Речь не прерывается.
  *   - loopTask: берёт готовые файлы из очереди и отправляет на сервер.
  *
  * ПОТОК ДАННЫХ:
@@ -62,7 +62,12 @@ constexpr size_t FRAME_BYTES   = FRAME_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES;
 
 constexpr size_t RING_SIZE_BYTES = 16384;              // ≈0.5 с звука запаса
 
-constexpr const char* CHUNK_FILES[2] = { "/chk_a.wav", "/chk_b.wav" };
+// Имена файлов УНИКАЛЬНЫ для каждого чанка сессии (/c0.wav ... /c5.wav):
+// при медленном Wi-Fi загрузка чанка может идти дольше записи следующего,
+// и переиспользование двух имён (ping-pong) приводило к удалению файла,
+// открытого загрузчиком -> порча SPIFFS. Максимум чанков = 30с/5с = 6.
+constexpr uint32_t MAX_CHUNKS = MAX_SECONDS / CHUNK_SECONDS;
+constexpr const char* LEGACY_CHUNK_FILES[] = { "/chk_a.wav", "/chk_b.wav" };
 
 // ============================ СОСТОЯНИЕ ===================================
 // ВАЖНО: типы объявлены ДО любых функций — автопрототипы Arduino IDE
@@ -278,7 +283,8 @@ void samplerTask(void*) {
     bool sessionHasAudio = false;   // ушёл ли хоть один чанк с данными
 
     while (!stopping) {
-      const char* path = CHUNK_FILES[chunkIndex & 1];
+      char path[12];
+      snprintf(path, sizeof(path), "/c%d.wav", chunkIndex);
 
       File f;
       if (!openChunkFile(f, path)) {
@@ -546,8 +552,13 @@ void setup() {
     blinkLed(5, 200, 200);
     while (true) delay(1000);
   }
-  for (const char* p : CHUNK_FILES) {
-    if (SPIFFS.exists(p)) SPIFFS.remove(p);   // мусор прошлой сессии
+  for (const char* p : LEGACY_CHUNK_FILES) {
+    if (SPIFFS.exists(p)) SPIFFS.remove(p);   // мусор старых версий
+  }
+  for (uint32_t i = 0; i < MAX_CHUNKS; i++) { // недоотправленные чанки прошлой сессии
+    char p[12];
+    snprintf(p, sizeof(p), "/c%u.wav", (unsigned)i);
+    if (SPIFFS.exists(p)) SPIFFS.remove(p);
   }
 
   WiFi.mode(WIFI_STA);
@@ -570,7 +581,7 @@ void setup() {
   adcInit();   // драйвер создаётся один раз; старт/стоп захвата — по сессии
 
   cmdQueue    = xQueueCreate(4, sizeof(BtnCmd));
-  uploadQueue = xQueueCreate(6, sizeof(UploadJob));
+  uploadQueue = xQueueCreate(MAX_CHUNKS + 2, sizeof(UploadJob));   // чанки + маркер
   spiffsMutex = xSemaphoreCreateMutex();
 
   // Приоритет выше loopTask; WiFi/lwIP всё ещё выше внутри IDF.
