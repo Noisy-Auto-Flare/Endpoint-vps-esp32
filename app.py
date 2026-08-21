@@ -137,7 +137,7 @@ def merge_wav_chunks(chunks: list) -> bytes:
     total_data_size = 0
     for chunk in chunks:
         if len(chunk) <= 44:
-            raise RuntimeError("chunk is too small to be a WAV")
+            continue  # пустой финальный маркер или заголовок без данных
         data_parts.append(chunk[44:])  # отрезаем заголовок
         total_data_size += len(chunk) - 44
 
@@ -282,7 +282,12 @@ def handle_voice_chunk():
         return jsonify({"error": "X-Chunk-Index must be >= 0"}), 400
 
     audio_bytes = request.get_data()
-    if not audio_bytes or len(audio_bytes) <= 44:
+    if is_final:
+        # Пустой финальный маркер допустим: кнопка стоп была нажата МЕЖДУ чанками
+        # (во время отправки предыдущего) — склеиваем всё накопленное ранее.
+        if audio_bytes and len(audio_bytes) < 44:
+            return jsonify({"error": "invalid final chunk, expected raw WAV bytes"}), 400
+    elif not audio_bytes or len(audio_bytes) <= 44:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
     # Очистка просроченных сессий (чтобы память не текла)

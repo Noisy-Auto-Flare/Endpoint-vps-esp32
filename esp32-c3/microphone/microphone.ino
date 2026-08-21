@@ -110,15 +110,23 @@ void IRAM_ATTR buttonISR() {
 // ===================== ОТПРАВКА ЧАНКА =====================
 
 // Отправляет файл /chunk.wav как raw body (не base64) на /api/voice-chunk.
+// ВАЖНО: файл открывается заново внутри — к моменту вызова он уже
+// закрыт после записи (writeWavHeader + close).
 // Возвращает true при HTTP 200.
 bool sendChunk(bool isFinal) {
-  uint32_t fileSize = audioFile.size();
+  File f = SPIFFS.open("/chunk.wav", "r");
+  if (!f) {
+    Serial.println("ОШИБКА: не удалось открыть /chunk.wav для отправки");
+    return false;
+  }
+  uint32_t fileSize = f.size();
 
   Serial.printf("Отправка чанка %d (%s), %lu байт...\n",
                 chunkIndex, isFinal ? "FINAL" : "chunk", fileSize);
 
   if (!httpClient.connect(BACKEND_HOST, BACKEND_PORT, 5000)) {
     Serial.println("ОШИБКА: не удалось подключиться к серверу");
+    f.close();
     return false;
   }
 
@@ -134,15 +142,16 @@ bool sendChunk(bool isFinal) {
   httpClient.printf("Connection: close\r\n\r\n");
 
   // --- Стрим WAV-байтов из файла ---
-  audioFile.seek(0);
+  f.seek(0);
   uint8_t buf[4096];
-  while (audioFile.available()) {
-    int n = audioFile.read(buf, sizeof(buf));
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
     if (n > 0) {
       httpClient.write(buf, n);
     }
   }
   httpClient.flush();
+  f.close();
 
   // --- Ждём ответ сервера ---
   unsigned long t = millis();
@@ -157,6 +166,43 @@ bool sendChunk(bool isFinal) {
   Serial.printf("Ответ сервера: %s -> %s\n",
                 statusLine.c_str(), ok ? "OK" : "ОШИБКА");
   return ok;
+}
+
+// Сессия завершилась МЕЖДУ чанками (стоп нажат во время отправки предыдущего):
+// уведомляем сервер пустым финальным маркером, чтобы он склеил накопленное.
+void sendFinalMarkerOnly() {
+  Serial.println("Стоп между чанками — отправляю финальный маркер...");
+
+  if (!httpClient.connect(BACKEND_HOST, BACKEND_PORT, 5000)) {
+    Serial.println("ОШИБКА: не удалось подключиться к серверу");
+    blinkLed(2, 100, 100);
+    return;
+  }
+
+  httpClient.printf("POST /api/voice-chunk HTTP/1.1\r\n");
+  httpClient.printf("Host: %s:%d\r\n", BACKEND_HOST, BACKEND_PORT);
+  httpClient.printf("X-Device-Key: %s\r\n", BACKEND_DEVICE_KEY);
+  httpClient.printf("X-Session-Id: %s\r\n", sessionId.c_str());
+  httpClient.printf("X-Chunk-Index: %d\r\n", chunkIndex);
+  httpClient.printf("X-Final: true\r\n");
+  httpClient.printf("Content-Type: audio/wav\r\n");
+  httpClient.printf("Content-Length: 0\r\n");
+  httpClient.printf("Connection: close\r\n\r\n");
+
+  unsigned long t = millis();
+  while (httpClient.available() < 12 && millis() - t < 8000) {
+    delay(1);
+  }
+  String statusLine = httpClient.readStringUntil('\n');
+  httpClient.stop();
+
+  if (statusLine.indexOf("200") >= 0) {
+    blinkLed(3, 120, 120);   // успех
+    Serial.println("=== Запись завершена (маркер), всё отправлено ===");
+  } else {
+    blinkLed(2, 100, 100);   // ошибка
+    Serial.println("Ответ сервера: " + statusLine);
+  }
 }
 
 // ====================== ИНДИКАЦИЯ LED ======================
@@ -220,10 +266,14 @@ void setup() {
 
 void loop() {
   if (!isRecording) {
-    // Ждём нажатия кнопки; короткая подсветка статуса
+    // Стоп мог быть нажат ПОСЛЕ завершения чанка (во время его отправки):
+    // закрываем сессию финальным маркером без данных.
     if (needFinalize) {
       needFinalize = false;
-      isRecording = false;
+      if (chunkIndex > 0) {
+        sendFinalMarkerOnly();
+        isRecording = false;
+      }
     }
     delay(10);
     return;
