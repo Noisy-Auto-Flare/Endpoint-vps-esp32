@@ -1,155 +1,364 @@
 /*
- * ESP32-C3 SuperMini + MAX4466 — голосовой микрофон для проекта "Шпора"
+ * ESP32-C3 SuperMini + MAX4466 — голосовой микрофон проекта "Шпора"
+ * Версия 2: эталонная архитектура на FreeRTOS с аппаратным DMA-семплингом.
  *
- * Схема работы (чанковая запись):
- *   1) Кнопка (GPIO9, BOOT) — старт/стоп записи
- *   2) Запись идёт чанками по 5 секунд в SPIFFS (WAV 16 кГц, 16 бит, моно)
- *   3) Каждый полный чанк сразу отправляется на сервер:
- *        POST /api/voice-chunk  + заголовки X-Session-Id / X-Chunk-Index / X-Final
- *   4) Стоп (или лимит 30 сек) — последний неполный чанк уходит с X-Final: true,
- *      сервер склеивает все чанки сессии в один WAV и отправляет в Gemini
- *   5) Ответ забирает microReader через GET /api/latest (как обычно)
+ * ПОЧЕМУ ТАК (по итогам исследования эталонных решений):
+ *   1) analogRead() занимает ~80-100 мкс — это МЕДЛЕННЕЕ периода 16 кГц
+ *      (62.5 мкс). Программный семплинг физически не успевает -> звук
+ *      пишется на заниженной частоте, питч съезжает, Whisper страдает.
+ *      Эталон для ESP32-C3 — драйвер adc_continuous: АЦП семплирует сам,
+ *      данные уходят в память по DMA без участия CPU.
+ *   2) На C3 НЕТ режима I2S-ADC (это только классический ESP32).
+ *   3) SPIFFS не потокобезопасен — все операции под мьютексом.
+ *
+ * ПОТОКИ:
+ *   - samplerTask: ждёт кнопку СТАРТ, непрерывно читает кадры DMA,
+ *     конвертирует в PCM и пишет в WAV-файлы чанками по 5 сек
+ *     (ping-pong между двумя файлами). Записал чанк -> в очередь
+ *     отправки -> СРАЗУ пишет следующий. Речь не прерывается никогда.
+ *   - loopTask: берёт готовые файлы из очереди и отправляет на сервер.
+ *
+ * ПОТОК ДАННЫХ:
+ *   MIC -> [DMA] -> кольцевой буфер -> активный WAV в SPIFFS
+ *       -> [очередь] -> HTTP POST /api/voice-chunk -> сервер склеивает
+ *       -> Groq STT -> Gemini -> ответ через GET /api/latest на microReader.
  *
  * Пины:
  *   GPIO4  — OUT микрофона MAX4466 (ADC1_CH4)
- *   GPIO9  — кнопка (BOOT, INPUT_PULLUP)
- *   GPIO8  — встроенный синий LED (активный LOW)
- *
- * Питание микрофона: VCC → 3V3 (или 5V), GND → GND, OUT → GPIO4
+ *   GPIO9  — кнопка (BOOT): старт/стоп записи
+ *   GPIO8  — встроенный синий LED: горит = запись;
+ *            2 мига = ошибка отправки; 3 мига = сессия успешно завершена;
+ *            5 мигов = фатальная ошибка (SPIFFS/Wi-Fi)
  */
 
+#include <Arduino.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
+#include <esp_timer.h>
+#include <esp_adc/adc_continuous.h>
 #include "config.h"
 
-// ============================ ПИНЫ ============================
+// ============================ ПИНЫ И ПАРАМЕТРЫ ============================
 
-#define MIC_PIN        4
-#define BUTTON_PIN     9
-#define LED_PIN        8
+constexpr int      MIC_PIN       = 4;      // ADC1_CH4 на ESP32-C3
+constexpr int      BUTTON_PIN    = 9;      // BOOT, INPUT_PULLUP
+constexpr int      LED_PIN       = 8;      // SuperMini: светится при LOW
 
-// ========================= ПАРАМЕТРЫ ==========================
+constexpr uint32_t SAMPLE_RATE   = 16000;  // Гц — держится железом (DMA)
+constexpr uint32_t CHUNK_SECONDS = 5;      // длительность одного чанка
+constexpr uint32_t MAX_SECONDS   = 30;     // жёсткий лимит всей записи
+constexpr int16_t  ADC_CENTER    = 2048;   // середина шкалы 12-бит ADC
+// Усиление: если Whisper слышит глухо — увеличь (16-24); если хрипы — уменьши.
+constexpr int32_t  MIC_GAIN      = 12;
 
-#define SAMPLE_RATE       16000
-#define CHUNK_SECONDS     5          // длительность одного чанка
-#define MAX_SECONDS       30         // жёсткий лимит записи
-#define SAMPLES_PER_CHUNK (SAMPLE_RATE * CHUNK_SECONDS)   // 80000 сэмплов = 160000 байт
-#define MAX_SAMPLES       (SAMPLE_RATE * MAX_SECONDS)     // 480000 сэмплов
+constexpr uint32_t SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_SECONDS;
+constexpr uint32_t MAX_TOTAL_SAMPLES = SAMPLE_RATE * MAX_SECONDS;
 
-// LED на SuperMini светится при LOW
-#define LED_ON()   digitalWrite(LED_PIN, LOW)
-#define LED_OFF()  digitalWrite(LED_PIN, HIGH)
+#ifndef SOC_ADC_DIGI_RESULT_BYTES
+#define SOC_ADC_DIGI_RESULT_BYTES 4   // байт на результат преобразования (C3, TYPE2)
+#endif
+constexpr size_t FRAME_SAMPLES = 256;                                  // сэмплов в кадре DMA
+constexpr size_t FRAME_BYTES   = FRAME_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES;
 
-// =========================== СТАТУС ===========================
+constexpr size_t RING_SIZE_BYTES = 16384;              // ≈0.5 с звука запаса
 
-volatile bool isRecording = false;
-volatile bool needFinalize = false;   // кнопка стоп нажата
-volatile bool maxTimeReached = false; // лимит времени вышел
+constexpr const char* CHUNK_FILES[2] = { "/chk_a.wav", "/chk_b.wav" };
 
-File audioFile;
-String sessionId;
-int chunkIndex = 0;
-unsigned long samplesInChunk = 0;
-unsigned long totalSamples = 0;
+inline void ledOn()  { digitalWrite(LED_PIN, LOW); }
+inline void ledOff() { digitalWrite(LED_PIN, HIGH); }
+void blinkLed(int times, int onMs, int offMs);
+
+// ============================ СОСТОЯНИЕ ===================================
+
+enum class BtnCmd : uint8_t { NONE = 0, START = 1, STOP = 2 };
+volatile BtnCmd isrRequest = BtnCmd::NONE;      // пишет только ISR
+
+struct UploadJob {
+  char file[16];          // путь в SPIFFS; "" => пустой финальный маркер
+  char sid[24];           // копия session id (защита от гонки сессий)
+  int  index;
+  bool finalChunk;
+};
+
+static QueueHandle_t       cmdQueue;      // loopTask -> samplerTask
+static QueueHandle_t       uploadQueue;   // samplerTask -> loopTask
+static SemaphoreHandle_t   spiffsMutex;   // SPIFFS не потокобезопасен!
+
+volatile bool recordingActive = false;
 
 WiFiClient httpClient;
 
-// ======================== WAV-ЗАГОЛОВОК ========================
+// ============================ УТИЛИТЫ =====================================
 
-void writeWavHeader(File &file, uint32_t dataSize) {
-  uint32_t fileSize = dataSize + 36;
-  uint32_t sampleRate = SAMPLE_RATE;
-  uint16_t numChannels = 1;
-  uint16_t bitsPerSample = 16;
-  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
-  uint16_t blockAlign = numChannels * bitsPerSample / 8;
-
-  file.seek(0);
-  file.write((const uint8_t*)"RIFF", 4);
-  file.write((uint8_t*)&fileSize, 4);
-  file.write((const uint8_t*)"WAVE", 4);
-  file.write((const uint8_t*)"fmt ", 4);
-
-  uint32_t subchunk1Size = 16;
-  uint16_t audioFormat = 1;
-  file.write((uint8_t*)&subchunk1Size, 4);
-  file.write((uint8_t*)&audioFormat, 2);
-  file.write((uint8_t*)&numChannels, 2);
-  file.write((uint8_t*)&sampleRate, 4);
-  file.write((uint8_t*)&byteRate, 4);
-  file.write((uint8_t*)&blockAlign, 2);
-  file.write((uint8_t*)&bitsPerSample, 2);
-
-  file.write((const uint8_t*)"data", 4);
-  file.write((uint8_t*)&dataSize, 4);
-}
-
-// =========================== КНОПКА ===========================
-
-void IRAM_ATTR buttonISR() {
-  static unsigned long lastPress = 0;
-  if (millis() - lastPress < 400) return;   // антидребезг
-  lastPress = millis();
-
-  if (!isRecording) {
-    isRecording = true;
-    needFinalize = false;
-    maxTimeReached = false;
-    samplesInChunk = 0;
-    totalSamples = 0;
-    chunkIndex = 0;
-    sessionId = String(millis()) + String(random(1000, 9999));
-    Serial.println(">>> Запись НАЧАЛАСЬ, сессия: " + sessionId);
-  } else {
-    isRecording = false;
-    needFinalize = true;
-    Serial.println(">>> Запись ОСТАНОВЛЕНА");
+void blinkLed(int times, int onMs, int offMs) {
+  for (int i = 0; i < times; i++) {
+    ledOn(); delay(onMs);
+    ledOff(); delay(offMs);
   }
 }
 
-// ====================== ПАРСИНГ ОТВЕТА ======================
-
-// Достаёт значение строкового поля из JSON-ответа сервера.
-// Простая ручная распаковка (как в microReader): кавычки, \n и \\ понимает.
-String extractJsonStr(const String &json, const char *key) {
-  String pat = String("\"") + key + "\":\"";
+String extractJsonStr(const String& json, const char* key) {
+  const String pat = String("\"") + key + "\":\"";
   int start = json.indexOf(pat);
   if (start < 0) return "";
   start += pat.length();
-  String out = "";
+  String out;
+  out.reserve(256);
   for (int i = start; i < (int)json.length(); i++) {
-    char c = json[i];
-    if (c == '\\') {                    // экранированный символ
+    const char c = json[i];
+    if (c == '\\') {
       if (i + 1 < (int)json.length()) {
-        char n = json[++i];
+        const char n = json[++i];
         if (n == 'n') out += '\n';
         else if (n == 't') out += '\t';
-        else out += n;                  // \" \\ и прочее -> сам символ
+        else out += n;
       }
-    } else if (c == '"') {
-      break;
-    } else {
-      out += c;
-    }
+    } else if (c == '"') break;
+    else out += c;
   }
   return out;
 }
 
-// ===================== ЧТЕНИЕ ОТВЕТА =====================
+void writeWavHeader(File& f, uint32_t dataSizeBytes) {
+  constexpr uint16_t CHANNELS = 1, BITS = 16;
+  const uint32_t byteRate   = SAMPLE_RATE * CHANNELS * BITS / 8;
+  const uint16_t blockAlign = CHANNELS * BITS / 8;
 
-// Читает полный HTTP-ответ от сервера и печатает отчёт.
-// expectReport=true — финальный запрос: печатаем путь распознавания,
-// транскрипт записи и ответ нейронки. Возвращает true при HTTP 200.
+  f.seek(0);
+  f.write((const uint8_t*)"RIFF", 4);
+  uint32_t v = dataSizeBytes + 36;  f.write((uint8_t*)&v, 4);
+  f.write((const uint8_t*)"WAVE", 4);
+  f.write((const uint8_t*)"fmt ", 4);
+  v = 16;                           f.write((uint8_t*)&v, 4);
+  uint16_t u = 1;                   f.write((uint8_t*)&u, 2);   // PCM
+  u = CHANNELS;                     f.write((uint8_t*)&u, 2);
+  v = SAMPLE_RATE;                  f.write((uint8_t*)&v, 4);
+  v = byteRate;                     f.write((uint8_t*)&v, 4);
+  u = blockAlign;                   f.write((uint8_t*)&u, 2);
+  u = BITS;                         f.write((uint8_t*)&u, 2);
+  f.write((const uint8_t*)"data", 4);
+  v = dataSizeBytes;                f.write((uint8_t*)&v, 4);
+}
+
+// ============================ ADC (DMA) ===================================
+
+static adc_continuous_handle_t adcHandle = nullptr;
+
+// Сырое 12-бит значение -> PCM16: центрирование, усиление, клиппинг
+static inline int16_t adcToPcm(uint16_t raw) {
+  int32_t s = ((int32_t)raw - ADC_CENTER) * (int32_t)MIC_GAIN;
+  if (s > 32767)  s = 32767;
+  if (s < -32768) s = -32768;
+  return (int16_t)s;
+}
+
+static void adcInit() {
+  adc_continuous_handle_cfg_t hcfg = {};
+  hcfg.max_store_buf_size = FRAME_BYTES * 4;
+  hcfg.conv_frame_size    = FRAME_BYTES;
+  ESP_ERROR_CHECK(adc_continuous_new_handle(&hcfg, &adcHandle));
+
+  // Официальный маппинг пин -> (unit, channel); GPIO4 -> ADC1_CH4 на C3
+  adc_unit_t unit = ADC_UNIT_1;
+  adc_channel_t ch = ADC_CHANNEL_4;
+  ESP_ERROR_CHECK(adc_continuous_io_to_channel(MIC_PIN, &unit, &ch));
+
+  adc_digi_pattern_config_t pattern = {};
+  pattern.atten     = ADC_ATTEN_DB_11;    // полный диапазон до ~3.1 В
+  pattern.bit_width = ADC_BITWIDTH_12;
+  pattern.unit      = unit;
+  pattern.channel   = ch;
+
+  adc_continuous_config_t cfg = {};
+  cfg.sample_freq_hz = SAMPLE_RATE;
+  cfg.conv_mode      = ADC_CONV_SINGLE_UNIT_1;
+  cfg.format         = ADC_DIGI_OUTPUT_FORMAT_TYPE2;   // ТОЛЬКО так на C3
+  cfg.pattern_num    = 1;
+  cfg.adc_pattern    = &pattern;
+  ESP_ERROR_CHECK(adc_continuous_config(adcHandle, &cfg));
+}
+
+static inline void adcStartCapture() {
+  ESP_ERROR_CHECK(adc_continuous_start(adcHandle));
+}
+
+static inline void adcStopCapture() {
+  adc_continuous_stop(adcHandle);
+}
+
+// ====================== КОЛЬЦЕВОЙ БУФЕР PCM ===============================
+
+// Один производитель и один потребитель — оба в samplerTask, без блокировок.
+static uint8_t ring[RING_SIZE_BYTES];
+static size_t  ringHead = 0, ringTail = 0, ringUsed = 0;
+
+inline void ringPush(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    ring[ringHead] = data[i];
+    ringHead = (ringHead + 1) % RING_SIZE_BYTES;
+  }
+  ringUsed += len;
+}
+
+inline size_t ringPop(uint8_t* dst, size_t maxLen) {
+  const size_t n = min(maxLen, ringUsed);
+  for (size_t i = 0; i < n; i++) {
+    dst[i] = ring[ringTail];
+    ringTail = (ringTail + 1) % RING_SIZE_BYTES;
+  }
+  ringUsed -= n;
+  return n;
+}
+
+// ============================ ЗАДАЧА ЗАПИСИ ===============================
+
+bool openChunkFile(File& f, const char* path) {
+  xSemaphoreTake(spiffsMutex, portMAX_DELAY);
+  if (SPIFFS.exists(path)) SPIFFS.remove(path);
+  bool ok = (bool)(f = SPIFFS.open(path, FILE_WRITE));
+  if (ok) {
+    static const uint8_t zeros[44] = {0};
+    ok = f.write(zeros, 44) == 44;
+  }
+  xSemaphoreGive(spiffsMutex);
+  if (!ok && f) f.close();
+  return ok;
+}
+
+void finalizeChunkFile(File& f, uint32_t pcmBytes) {
+  xSemaphoreTake(spiffsMutex, portMAX_DELAY);
+  writeWavHeader(f, pcmBytes);
+  f.close();
+  xSemaphoreGive(spiffsMutex);
+}
+
+void samplerTask(void*) {
+  // Кадр DMA выровнен по границе 4 байт (требование DMA-драйвера)
+  static uint8_t frame[FRAME_BYTES] __attribute__((aligned(4)));
+
+  for (;;) {  // жизнь задачи: спим до START, потом пишем до STOP
+    BtnCmd cmd;
+    xQueueReceive(cmdQueue, &cmd, portMAX_DELAY);
+    if (cmd != BtnCmd::START) continue;
+
+    // --- Старт сессии (все переменные локальны — гонок с новой сессией нет) ---
+    String sessionId = String((unsigned long)(esp_timer_get_time() / 1000000ULL)) +
+                       String(random(1000, 9999));
+    int chunkIndex = 0;
+    ringHead = ringTail = ringUsed = 0;
+
+    adcStartCapture();
+
+    // Прогрев конвейера DMA: выбрасываем первый кадр (может содержать мусор)
+    uint32_t got = 0;
+    adc_continuous_read(adcHandle, frame, sizeof(frame), &got, pdMS_TO_TICKS(500));
+
+    recordingActive = true;
+    ledOn();
+    Serial.println(">>> Запись НАЧАЛАСЬ, сессия: " + sessionId);
+
+    bool stopping = false;
+    bool sessionHasAudio = false;   // ушёл ли хоть один чанк с данными
+
+    while (!stopping) {
+      const char* path = CHUNK_FILES[chunkIndex & 1];
+
+      File f;
+      if (!openChunkFile(f, path)) {
+        Serial.println("ФАТАЛЬНО: не удалось открыть файл чанка");
+        adcStopCapture();
+        recordingActive = false;
+        ledOff();
+        blinkLed(5, 200, 200);
+        goto sessionEnd;
+      }
+
+      // --- Семплирование одного чанка ---
+      uint32_t chunkSamples = 0;
+      while (chunkSamples < SAMPLES_PER_CHUNK) {
+        // Реакция на стоп — между кадрами DMA (латентность ≤ 16 мс)
+        if (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE &&
+            cmd == BtnCmd::STOP) {
+          stopping = true;
+          break;
+        }
+
+        const esp_err_t err = adc_continuous_read(
+            adcHandle, frame, sizeof(frame), &got, pdMS_TO_TICKS(200));
+        if (err != ESP_OK || got == 0) continue;   // таймаут — просто дальше
+
+        // Кадр TYPE2 -> PCM16 -> кольцевой буфер
+        for (size_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= got;
+             i += SOC_ADC_DIGI_RESULT_BYTES) {
+          const adc_digi_output_data_t* p =
+              (const adc_digi_output_data_t*)&frame[i];
+          const int16_t pcm = adcToPcm(p->type2.data);
+          ringPush((const uint8_t*)&pcm, sizeof(pcm));
+        }
+        chunkSamples += got / SOC_ADC_DIGI_RESULT_BYTES;
+
+        // Сливаем буфер в файл (все операции SPIFFS — под мьютексом)
+        uint8_t io[512];
+        xSemaphoreTake(spiffsMutex, portMAX_DELAY);
+        size_t n;
+        while ((n = ringPop(io, sizeof(io))) > 0) f.write(io, n);
+        xSemaphoreGive(spiffsMutex);
+
+        // Жёсткий лимит длины всей записи
+        if ((uint32_t)chunkIndex * SAMPLES_PER_CHUNK + chunkSamples >=
+            MAX_TOTAL_SAMPLES) {
+          stopping = true;
+          break;
+        }
+      }
+
+      // --- Финализируем чанк и ставим в очередь отправки ---
+      finalizeChunkFile(f, chunkSamples * 2);
+
+      const bool nothingRecorded = (chunkSamples == 0);
+
+      // Случай "стоп в момент ровно между чанками, данных нет вообще":
+      // пустую сессию не отправляем вовсе.
+      if (!(nothingRecorded && !sessionHasAudio)) {
+        UploadJob job{};
+        if (!nothingRecorded) {
+          strncpy(job.file, path, sizeof(job.file) - 1);
+          sessionHasAudio = true;
+        }
+        strncpy(job.sid, sessionId.c_str(), sizeof(job.sid) - 1);
+        job.index = chunkIndex;
+        job.finalChunk = stopping;
+        xQueueSend(uploadQueue, &job, portMAX_DELAY);
+
+        Serial.printf("Чанк %d готов (%lu байт)%s\n", job.index,
+                      (unsigned long)(nothingRecorded ? 44 : chunkSamples * 2 + 44),
+                      job.finalChunk ? " [FINAL]" : "");
+      } else {
+        Serial.println("Нечего отправлять: запись почти мгновенно остановлена.");
+      }
+
+      chunkIndex++;
+    }
+
+    adcStopCapture();
+    recordingActive = false;
+    ledOff();
+    Serial.println(">>> Запись завершена");
+
+sessionEnd:;
+  }
+}
+
+// ========================= ОТПРАВКА НА СЕРВЕР =============================
+
 bool readResponseAndReport(bool expectReport) {
-  // Ждём ПЕРВЫЙ БАЙТ: финал обрабатывается 10-25 с (Groq + Gemini)
   unsigned long startMs = millis();
   while (!httpClient.available() && httpClient.connected() &&
          millis() - startMs < 20000) {
     delay(10);
   }
 
-  // Читаем всё остальное: пока идут данные или сокет жив
-  String body = "";
+  String body;
   unsigned long lastData = millis();
   uint8_t rbuf[512];
   while (httpClient.connected() || httpClient.available()) {
@@ -159,20 +368,18 @@ bool readResponseAndReport(bool expectReport) {
         body.concat((const char*)rbuf, n);
         lastData = millis();
       } else {
-        delay(5);              // read() вернул -1 — данных в этот раз нет
+        delay(5);
       }
       continue;
     }
-    if (millis() - lastData > 3000) break;   // тишина 3 с после потока — всё
+    if (millis() - lastData > 3000) break;
     delay(10);
   }
   httpClient.stop();
 
-  // Статус ищем по всему телу ("HTTP/1.1 200 OK") — без привязки к префиксу
-  bool ok = (body.indexOf(" 200 ") >= 0);
+  const bool ok = body.indexOf(" 200 ") >= 0;
   Serial.printf("Ответ за %lu мс, тело %u байт -> %s\n",
                 millis() - startMs, body.length(), ok ? "OK" : "ОШИБКА");
-
   if (!ok) {
     Serial.print("[debug] первые байты: ");
     Serial.println(body.length() ? body.substring(0, 80) : String("(пусто)"));
@@ -180,9 +387,9 @@ bool readResponseAndReport(bool expectReport) {
   }
 
   if (expectReport) {
-    String sttPath    = extractJsonStr(body, "stt");
-    String transcript = extractJsonStr(body, "transcript");
-    String answerText = extractJsonStr(body, "text");
+    const String sttPath    = extractJsonStr(body, "stt");
+    const String transcript = extractJsonStr(body, "transcript");
+    const String answerText = extractJsonStr(body, "text");
 
     Serial.println("========================================");
     Serial.println("Путь распознавания: " +
@@ -191,156 +398,139 @@ bool readResponseAndReport(bool expectReport) {
     Serial.println(transcript.length() ? transcript : "(пусто)");
     if (answerText.length()) {
       Serial.println("--- ОТВЕТ НЕЙРОНКИ (первые 400 симв.) ---");
-      if (answerText.length() > 400) {
-        Serial.println(answerText.substring(0, 400) + "...");
-      } else {
-        Serial.println(answerText);
-      }
+      Serial.println(answerText.length() > 400
+                         ? answerText.substring(0, 400) + "..."
+                         : answerText);
     }
     Serial.println("========================================");
   }
-
   return true;
 }
 
-// ===================== ОТПРАВКА ЧАНКА =====================
+bool sendJob(const UploadJob& job) {
+  File f;
+  uint32_t fileSize = 0;
+  const bool hasFile = job.file[0] != '\0';
 
-// Отправляет файл /chunk.wav как raw body (не base64) на /api/voice-chunk.
-// ВАЖНО: файл открывается заново внутри — к моменту вызова он уже
-// закрыт после записи (writeWavHeader + close).
-// Возвращает true при HTTP 200.
-bool sendChunk(bool isFinal) {
-  File f = SPIFFS.open("/chunk.wav", "r");
-  if (!f) {
-    Serial.println("ОШИБКА: не удалось открыть /chunk.wav для отправки");
-    return false;
+  if (hasFile) {
+    xSemaphoreTake(spiffsMutex, portMAX_DELAY);
+    f = SPIFFS.open(job.file, FILE_READ);
+    xSemaphoreGive(spiffsMutex);
+    if (!f) {
+      Serial.println("ОШИБКА: не удалось открыть файл для отправки");
+      return false;
+    }
+    fileSize = f.size();
   }
-  uint32_t fileSize = f.size();
 
-  Serial.printf("Отправка чанка %d (%s), %lu байт...\n",
-                chunkIndex, isFinal ? "FINAL" : "chunk", fileSize);
+  Serial.printf("Отправка чанка %d (%s), %u байт...\n",
+                job.index, job.finalChunk ? "FINAL" : "chunk", fileSize);
 
   if (!httpClient.connect(BACKEND_HOST, BACKEND_PORT, 5000)) {
-    Serial.println("ОШИБКА: не удалось подключиться к серверу");
-    f.close();
+    Serial.println("ОШИБКА: нет соединения с сервером");
+    if (f) f.close();
     return false;
   }
-  // ВАЖНО: слабый Wi-Fi + большой чанк -> блокирующая отправка дольше 5 с.
-  // Без этого сокет рвётся по внутреннему таймауту прямо посреди загрузки.
-  httpClient.setTimeout(30000);
+  httpClient.setTimeout(30000);   // слабый Wi-Fi + большой чанк
 
-  // --- HTTP-заголовки ---
   httpClient.printf("POST /api/voice-chunk HTTP/1.1\r\n");
   httpClient.printf("Host: %s:%d\r\n", BACKEND_HOST, BACKEND_PORT);
   httpClient.printf("X-Device-Key: %s\r\n", BACKEND_DEVICE_KEY);
-  httpClient.printf("X-Session-Id: %s\r\n", sessionId.c_str());
-  httpClient.printf("X-Chunk-Index: %d\r\n", chunkIndex);
-  httpClient.printf("X-Final: %s\r\n", isFinal ? "true" : "false");
+  httpClient.printf("X-Session-Id: %s\r\n", job.sid);
+  httpClient.printf("X-Chunk-Index: %d\r\n", job.index);
+  httpClient.printf("X-Final: %s\r\n", job.finalChunk ? "true" : "false");
   httpClient.printf("Content-Type: audio/wav\r\n");
-  httpClient.printf("Content-Length: %lu\r\n", fileSize);
+  httpClient.printf("Content-Length: %u\r\n", fileSize);
   httpClient.printf("Connection: close\r\n\r\n");
 
-  // --- Стрим WAV-байтов из файла (с контролем каждой записи) ---
-  f.seek(0);
-  uint8_t buf[4096];
-  size_t totalSent = 0;
-  bool sendFail = false;
-  unsigned long upStart = millis();
-  while (f.available()) {
-    int n = f.read(buf, sizeof(buf));
-    if (n <= 0) break;
-    size_t written = httpClient.write(buf, n);
-    totalSent += written;
-    delay(1);   // отдаём слот WiFi-стеку: без этого длинная блокирующая
-                // отправка может уронить lwIP (assert xQueueSemaphoreTake)
-    if (written != (size_t)n) {
-      Serial.printf("ОШИБКА отправки: записано %u из %d байт (итого %u/%u)\n",
-                    (unsigned)written, n, (unsigned)totalSent, (unsigned)fileSize);
-      sendFail = true;
-      break;
+  if (hasFile) {
+    unsigned long upStart = millis();
+    size_t totalSent = 0;
+    bool fail = false;
+    uint8_t buf[4096];
+    while (f.available()) {
+      int n = f.read(buf, sizeof(buf));
+      if (n <= 0) break;
+      const size_t written = httpClient.write(buf, n);
+      totalSent += written;
+      delay(1);   // слот WiFi-стеку: длинная блокировка роняет lwIP
+      if (written != (size_t)n) {
+        Serial.printf("ОШИБКА отправки: записано %u из %d (итого %u/%u)\n",
+                      (unsigned)written, n,
+                      (unsigned)totalSent, (unsigned)fileSize);
+        fail = true;
+        break;
+      }
+    }
+    httpClient.flush();
+    f.close();
+    if (fail || totalSent != fileSize) {
+      Serial.printf("Загрузка оборвалась: %u/%u байт за %lu мс\n",
+                    (unsigned)totalSent, (unsigned)fileSize,
+                    millis() - upStart);
+      httpClient.stop();
+      return false;
     }
   }
-  httpClient.flush();
-  f.close();
 
-  if (sendFail || totalSent != fileSize) {
-    Serial.printf("Загрузка оборвалась: отправлено %u из %u байт за %lu мс\n",
-                  (unsigned)totalSent, (unsigned)fileSize, millis() - upStart);
-    Serial.print("[debug] состояние сокета connected=");
-    Serial.println(httpClient.connected());
-    httpClient.stop();
-    return false;
-  }
-
-  // --- Читаем ответ и печатаем отчёт (транскрипт/ответ — только для финала) ---
-  return readResponseAndReport(isFinal);
+  return readResponseAndReport(job.finalChunk);
 }
 
-// Сессия завершилась МЕЖДУ чанками (стоп нажат во время отправки предыдущего):
-// уведомляем сервер пустым финальным маркером, чтобы он склеил накопленное.
-void sendFinalMarkerOnly() {
-  Serial.println("Стоп между чанками — отправляю финальный маркер...");
+// ======================== LOOP: ОТПРАВЩИК =================================
 
-  if (!httpClient.connect(BACKEND_HOST, BACKEND_PORT, 5000)) {
-    Serial.println("ОШИБКА: не удалось подключиться к серверу");
-    blinkLed(2, 100, 100);
-    return;
+void loop() {
+  // Перенаправляем запрос кнопки задаче записи
+  if (isrRequest != BtnCmd::NONE) {
+    const BtnCmd req = isrRequest;
+    isrRequest = BtnCmd::NONE;
+    if (req == BtnCmd::START ||
+        (req == BtnCmd::STOP && recordingActive)) {
+      xQueueSend(cmdQueue, &req, 0);
+    }
   }
-  httpClient.setTimeout(30000);
 
-  httpClient.printf("POST /api/voice-chunk HTTP/1.1\r\n");
-  httpClient.printf("Host: %s:%d\r\n", BACKEND_HOST, BACKEND_PORT);
-  httpClient.printf("X-Device-Key: %s\r\n", BACKEND_DEVICE_KEY);
-  httpClient.printf("X-Session-Id: %s\r\n", sessionId.c_str());
-  httpClient.printf("X-Chunk-Index: %d\r\n", chunkIndex);
-  httpClient.printf("X-Final: true\r\n");
-  httpClient.printf("Content-Type: audio/wav\r\n");
-  httpClient.printf("Content-Length: 0\r\n");
-  httpClient.printf("Connection: close\r\n\r\n");
+  UploadJob job;
+  if (xQueueReceive(uploadQueue, &job, pdMS_TO_TICKS(100)) == pdTRUE) {
+    const bool ok = sendJob(job);
 
-  // Тот же полный отчёт: транскрипт накопленного + ответ нейронки
-  if (readResponseAndReport(true)) {
-    blinkLed(3, 120, 120);   // успех
-    Serial.println("=== Запись завершена (маркер), всё отправлено ===");
-  } else {
-    blinkLed(2, 100, 100);   // ошибка
-    Serial.println("Маркер не прошёл");
+    if (ok && job.file[0] != '\0') {
+      xSemaphoreTake(spiffsMutex, portMAX_DELAY);
+      SPIFFS.remove(job.file);
+      xSemaphoreGive(spiffsMutex);
+    }
+
+    if (job.finalChunk) {
+      if (ok) {
+        blinkLed(3, 120, 120);
+        Serial.println("=== Сессия полностью отправлена ===");
+      } else {
+        blinkLed(2, 100, 100);
+        Serial.println("=== Сессия завершена С ОШИБКОЙ отправки ===");
+      }
+    }
   }
 }
 
-// ====================== ИНДИКАЦИЯ LED ======================
-
-void blinkLed(int times, int onMs, int offMs) {
-  for (int i = 0; i < times; i++) {
-    LED_ON();
-    delay(onMs);
-    LED_OFF();
-    delay(offMs);
-  }
-}
-
-// ========================== SETUP ==========================
+// ================================ SETUP ===================================
 
 void setup() {
   Serial.begin(115200);
   delay(800);
-  Serial.println("\n=== ESP32-C3 Voice Chunks ===");
-  Serial.printf("Свободная память при старте: %d байт\n", ESP.getFreeHeap());
+  Serial.println("\n=== ESP32-C3 Voice Chunks v2 (DMA) ===");
+  Serial.printf("Свободная память: %d байт\n", ESP.getFreeHeap());
 
   pinMode(LED_PIN, OUTPUT);
-  LED_OFF();
+  ledOff();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
 
   if (!SPIFFS.begin(true)) {
     Serial.println("Ошибка SPIFFS!");
-    blinkLed(5, 200, 200);   // SOS: 5 длинных миганий
-    while (1) delay(1000);
+    blinkLed(5, 200, 200);
+    while (true) delay(1000);
   }
-
-  // Удаляем старый файл-чанк
-  if (SPIFFS.exists("/chunk.wav")) {
-    SPIFFS.remove("/chunk.wav");
+  for (const char* p : CHUNK_FILES) {
+    if (SPIFFS.exists(p)) SPIFFS.remove(p);   // мусор прошлой сессии
   }
 
   WiFi.mode(WIFI_STA);
@@ -353,115 +543,34 @@ void setup() {
     attempts++;
   }
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nОШИБКА: нет Wi-Fi! Перезагрузка...");
+    Serial.println("\nНет Wi-Fi! Перезагрузка...");
     blinkLed(5, 100, 100);
     ESP.restart();
   }
-  Serial.println();
-  Serial.print("IP адрес: ");
-  Serial.println(WiFi.localIP());
-  Serial.printf("Свободная память после Wi-Fi: %d байт\n", ESP.getFreeHeap());
+  Serial.printf("\nIP: %s, куча после Wi-Fi: %d байт\n",
+                WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+
+  adcInit();   // драйвер создаётся один раз; старт/стоп захвата — по сессии
+
+  cmdQueue    = xQueueCreate(4, sizeof(BtnCmd));
+  uploadQueue = xQueueCreate(6, sizeof(UploadJob));
+  spiffsMutex = xSemaphoreCreateMutex();
+
+  // Приоритет выше loopTask; WiFi/lwIP всё ещё выше внутри IDF.
+  // Чтение DMA-кадра блокирует задачу на семафоре -> CPU отдаётся сети.
+  xTaskCreate(samplerTask, "sampler", 8192, nullptr, 3, nullptr);
 
   Serial.println("Готов к работе. Кнопка = старт/стоп записи.");
 }
 
-// =========================== LOOP ==========================
+// ============================== ISR =======================================
 
-void loop() {
-  if (!isRecording) {
-    // Стоп мог быть нажат ПОСЛЕ завершения чанка (во время его отправки):
-    // закрываем сессию финальным маркером без данных.
-    if (needFinalize) {
-      needFinalize = false;
-      if (chunkIndex > 0) {
-        sendFinalMarkerOnly();
-        isRecording = false;
-      }
-    }
-    delay(10);
-    return;
-  }
+void IRAM_ATTR buttonISR() {
+  static unsigned long lastPressMs = 0;
+  const unsigned long now = (unsigned long)(esp_timer_get_time() / 1000ULL);
+  if (now - lastPressMs < 400) return;   // антидребезг
+  lastPressMs = now;
 
-  // === Старт нового чанка ===
-  if (samplesInChunk == 0) {
-    audioFile = SPIFFS.open("/chunk.wav", FILE_WRITE);
-    if (!audioFile) {
-      Serial.println("Не удалось открыть файл чанка!");
-      isRecording = false;
-      blinkLed(2, 100, 100);   // 2 мига = ошибка
-      return;
-    }
-    // Резервируем место под заголовок (44 байта)
-    uint8_t header[44] = {0};
-    audioFile.write(header, 44);
-    LED_ON();   // запись идёт
-  }
-
-  // === Запись сэмплов с точным таймингом ===
-  unsigned long nextSampleUs = micros();
-  while (isRecording && samplesInChunk < SAMPLES_PER_CHUNK) {
-    // Держим частоту ровно 16 кГц (период 62.5 мкс)
-    long waitUs = nextSampleUs - (long)micros();
-    if (waitUs > 0) {
-      delayMicroseconds(waitUs);
-      continue;
-    }
-    nextSampleUs += 1000000UL / SAMPLE_RATE;
-
-    int raw = analogRead(MIC_PIN);
-    int16_t sample = (int16_t)((raw - 2048) * 12);   // центрирование + усиление
-    audioFile.write((uint8_t*)&sample, 2);
-    samplesInChunk++;
-    totalSamples++;
-
-    // Лимит 30 секунд — принудительный финал
-    if (totalSamples >= MAX_SAMPLES) {
-      maxTimeReached = true;
-      isRecording = false;
-      break;
-    }
-  }
-
-  // === Кнопка стоп или лимит времени ===
-  bool chunkComplete = (samplesInChunk >= SAMPLES_PER_CHUNK);
-  bool stopPressed = needFinalize;
-
-  if (chunkComplete || stopPressed || maxTimeReached) {
-    LED_OFF();
-    needFinalize = false;
-
-    uint32_t dataSize = samplesInChunk * 2;
-    writeWavHeader(audioFile, dataSize);
-    audioFile.close();
-    Serial.printf("Чанк сохранён: %lu сэмплов (%lu байт)\n",
-                  samplesInChunk, dataSize + 44);
-
-    // Финальный чанк: запись остановлена ИЛИ достигнут лимит времени
-    bool isFinal = stopPressed || maxTimeReached;
-
-    bool ok = sendChunk(isFinal);
-    if (!ok) {
-      blinkLed(2, 100, 100);   // 2 мига = ошибка отправки
-      Serial.println("Чанк НЕ отправлен. Запись прекращена.");
-      isRecording = false;
-      return;
-    }
-
-    if (isFinal) {
-      blinkLed(3, 120, 120);   // 3 мига = успех
-      Serial.println("=== Запись завершена, всё отправлено ===");
-      isRecording = false;
-      return;
-    }
-
-    // Переходим к следующему чанку
-    chunkIndex++;
-    samplesInChunk = 0;
-
-    // Маленькая пауза, чтобы файл освободился
-    delay(50);
-    if (SPIFFS.exists("/chunk.wav")) {
-      SPIFFS.remove("/chunk.wav");
-    }
-  }
+  // Только флаг: никаких String/Serial/heap в ISR!
+  isrRequest = recordingActive ? BtnCmd::STOP : BtnCmd::START;
 }
