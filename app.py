@@ -25,6 +25,7 @@
 import argparse
 import base64
 import os
+import struct
 import threading
 import time
 
@@ -54,11 +55,12 @@ PHOTO_SYSTEM_PROMPT = os.environ.get(
     "PHOTO_SYSTEM_PROMPT",
     "Если на фото какое-то задание, задача, то выведи, какие условия ты распознал, подробно и с объяснениями реши это задание без markdown-разметки и любых специальных символов. "
     "Если на фото что-то кроме заданий, то опиши, что ты видишь"
-
-
-
-
 )
+
+# Голосовые сессии ESP32-C3: накопление чанков по 5 секунд,
+# склейка в один WAV и отправка в Gemini при приходе финального чанка.
+VOICE_SESSION_TTL = 600          # секунд: сессия без финального чанка сгорает
+VOICE_MAX_CHUNKS = 20            # максимум чанков на сессию (20 * 5 сек = 100 сек записи)
 
 # =====================================================================
 
@@ -74,6 +76,10 @@ _state = {
     "source": None,      # "photo" или "voice"
     "created_at": 0,
 }
+
+# Накопление голосовых чанков от ESP32-C3: session_id -> {"chunks": [bytes], "created_at": float}
+_voice_sessions_lock = threading.Lock()
+_voice_sessions = {}
 
 
 def require_device_key():
@@ -115,6 +121,52 @@ def call_gemini(system_prompt: str, parts: list) -> str:
     content_parts = candidates[0].get("content", {}).get("parts", [])
     text_chunks = [p.get("text", "") for p in content_parts if "text" in p]
     return "".join(text_chunks).strip()
+
+
+def merge_wav_chunks(chunks: list) -> bytes:
+    """
+    Склеивает несколько WAV-файлов (16 кГц, 16 бит, моно) в один WAV.
+
+    Каждый чанк с ESP32-C3 — полноценный WAV-файл с заголовком 44 байта.
+    Вырезаем data-секцию каждого чанка и собираем единый WAV с новым заголовком.
+    """
+    if not chunks:
+        raise RuntimeError("empty chunks")
+
+    data_parts = []
+    total_data_size = 0
+    for chunk in chunks:
+        if len(chunk) <= 44:
+            raise RuntimeError("chunk is too small to be a WAV")
+        data_parts.append(chunk[44:])  # отрезаем заголовок
+        total_data_size += len(chunk) - 44
+
+    if total_data_size == 0:
+        raise RuntimeError("chunks contain no audio data")
+
+    sample_rate = 16000
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + total_data_size,
+        b"WAVE",
+        b"fmt ",
+        16,                       # subchunk1 size
+        1,                        # audio format: PCM
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        total_data_size,
+    )
+    return header + b"".join(data_parts)
 
 
 # ---------------------------------------------------------------------
@@ -199,6 +251,85 @@ def handle_voice():
 
     set_latest_result(answer, source="voice")
     return jsonify({"ok": True, "text": answer})
+
+
+# ---------------------------------------------------------------------
+# POST /api/voice-chunk — принимает WAV-чанки записи по 5 секунд от ESP32-C3
+# Заголовки:
+#   X-Session-Id:   уникальный ID сессии (одна сессия = одна запись целиком)
+#   X-Chunk-Index:  0-based номер чанка (порядок склейки)
+#   X-Final:        "true" на последнем чанке — после него сервер склеивает всё
+#                   и отправляет в Gemini
+# ---------------------------------------------------------------------
+@app.route("/api/voice-chunk", methods=["POST"])
+def handle_voice_chunk():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    session_id = request.headers.get("X-Session-Id", "").strip()
+    chunk_index = request.headers.get("X-Chunk-Index", "0").strip()
+    is_final = request.headers.get("X-Final", "false").strip().lower() == "true"
+
+    if not session_id:
+        return jsonify({"error": "missing X-Session-Id header"}), 400
+
+    try:
+        chunk_index = int(chunk_index)
+    except ValueError:
+        return jsonify({"error": "X-Chunk-Index must be an integer"}), 400
+
+    if chunk_index < 0:
+        return jsonify({"error": "X-Chunk-Index must be >= 0"}), 400
+
+    audio_bytes = request.get_data()
+    if not audio_bytes or len(audio_bytes) <= 44:
+        return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
+
+    # Очистка просроченных сессий (чтобы память не текла)
+    now = time.time()
+    with _voice_sessions_lock:
+        expired = [sid for sid, s in _voice_sessions.items() if now - s["created_at"] > VOICE_SESSION_TTL]
+        for sid in expired:
+            del _voice_sessions[sid]
+
+        session = _voice_sessions.get(session_id)
+        if session is None:
+            session = {"chunks": [], "created_at": now}
+            _voice_sessions[session_id] = session
+
+        # Защита от разрастания: сбрасываем сессию, если пришло слишком много чанков
+        if len(session["chunks"]) >= VOICE_MAX_CHUNKS:
+            del _voice_sessions[session_id]
+            return jsonify({"error": "too many chunks, session reset"}), 413
+
+        session["chunks"].append(audio_bytes)
+
+        if not is_final:
+            return jsonify({"ok": True, "chunks_received": len(session["chunks"])})
+
+        # Финальный чанк: забираем накопленное и очищаем сессию
+        chunks = list(session["chunks"])
+        del _voice_sessions[session_id]
+
+    try:
+        merged_audio = merge_wav_chunks(chunks)
+    except RuntimeError as e:
+        return jsonify({"error": f"failed to merge chunks: {e}"}), 400
+
+    audio_b64 = base64.b64encode(merged_audio).decode("utf-8")
+
+    try:
+        answer = call_gemini(
+            VOICE_SYSTEM_PROMPT,
+            [
+                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+            ],
+        )
+    except (requests.RequestException, RuntimeError) as e:
+        return jsonify({"error": f"gemini request failed: {e}"}), 502
+
+    set_latest_result(answer, source="voice_chunks")
+    return jsonify({"ok": True, "final": True, "text": answer})
 
 
 # ---------------------------------------------------------------------

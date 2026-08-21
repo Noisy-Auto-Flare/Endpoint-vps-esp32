@@ -1,6 +1,9 @@
 # ESP32-CAM config (содержит SSID/пароль/IP/ключ)
 esp32-cam/ESP32_CAM_recorder/config.h
 
+# ESP32-C3 microphone config (содержит SSID/пароль/IP/ключ)
+esp32-c3/microphone/config.h
+
 # Environment
 .env
 
