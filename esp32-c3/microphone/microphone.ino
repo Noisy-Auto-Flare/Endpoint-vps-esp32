@@ -135,6 +135,74 @@ String extractJsonStr(const String &json, const char *key) {
   return out;
 }
 
+// ===================== ЧТЕНИЕ ОТВЕТА =====================
+
+// Читает полный HTTP-ответ от сервера и печатает отчёт.
+// expectReport=true — финальный запрос: печатаем путь распознавания,
+// транскрипт записи и ответ нейронки. Возвращает true при HTTP 200.
+bool readResponseAndReport(bool expectReport) {
+  // Ждём ПЕРВЫЙ БАЙТ: финал обрабатывается 10-25 с (Groq + Gemini)
+  unsigned long startMs = millis();
+  while (!httpClient.available() && httpClient.connected() &&
+         millis() - startMs < 20000) {
+    delay(10);
+  }
+
+  // Читаем всё остальное: пока идут данные или сокет жив
+  String body = "";
+  unsigned long lastData = millis();
+  uint8_t rbuf[512];
+  while (httpClient.connected() || httpClient.available()) {
+    if (httpClient.available()) {
+      int n = httpClient.read(rbuf, sizeof(rbuf));
+      if (n > 0) {
+        body.concat((const char*)rbuf, n);
+        lastData = millis();
+      } else {
+        delay(5);              // read() вернул -1 — данных в этот раз нет
+      }
+      continue;
+    }
+    if (millis() - lastData > 3000) break;   // тишина 3 с после потока — всё
+    delay(10);
+  }
+  httpClient.stop();
+
+  // Статус ищем по всему телу ("HTTP/1.1 200 OK") — без привязки к префиксу
+  bool ok = (body.indexOf(" 200 ") >= 0);
+  Serial.printf("Ответ за %lu мс, тело %u байт -> %s\n",
+                millis() - startMs, body.length(), ok ? "OK" : "ОШИБКА");
+
+  if (!ok) {
+    Serial.print("[debug] первые байты: ");
+    Serial.println(body.length() ? body.substring(0, 80) : String("(пусто)"));
+    return false;
+  }
+
+  if (expectReport) {
+    String sttPath    = extractJsonStr(body, "stt");
+    String transcript = extractJsonStr(body, "transcript");
+    String answerText = extractJsonStr(body, "text");
+
+    Serial.println("========================================");
+    Serial.println("Путь распознавания: " +
+                   (sttPath.length() ? sttPath : String("(нет данных)")));
+    Serial.println("--- ЧТО РАСПОЗНАНО ИЗ ЗАПИСИ ---");
+    Serial.println(transcript.length() ? transcript : "(пусто)");
+    if (answerText.length()) {
+      Serial.println("--- ОТВЕТ НЕЙРОНКИ (первые 400 симв.) ---");
+      if (answerText.length() > 400) {
+        Serial.println(answerText.substring(0, 400) + "...");
+      } else {
+        Serial.println(answerText);
+      }
+    }
+    Serial.println("========================================");
+  }
+
+  return true;
+}
+
 // ===================== ОТПРАВКА ЧАНКА =====================
 
 // Отправляет файл /chunk.wav как raw body (не base64) на /api/voice-chunk.
@@ -204,67 +272,8 @@ bool sendChunk(bool isFinal) {
     return false;
   }
 
-  // --- Ждём ПЕРВЫЙ БАЙТ ответа (финальный чанк ждёт Gemini до ~10-15 c) ---
-  unsigned long startMs = millis();
-  while (!httpClient.available() && httpClient.connected() &&
-         millis() - startMs < 15000) {
-    delay(10);
-  }
-
-  // --- Читаем всё: пока идут данные или сокет жив ---
-  String body = "";
-  unsigned long lastData = millis();
-  uint8_t rbuf[512];
-  while (httpClient.connected() || httpClient.available()) {
-    if (httpClient.available()) {
-      int n = httpClient.read(rbuf, sizeof(rbuf));
-      if (n > 0) {
-        body.concat((const char*)rbuf, n);
-        lastData = millis();
-      } else {
-        delay(5);              // read() вернул -1 — данных в этот раз нет
-      }
-      continue;
-    }
-    if (millis() - lastData > 3000) break;   // тишина 3 с после потока — всё
-    delay(10);
-  }
-  httpClient.stop();
-
-  // Статус ищем по всему началу тела ("HTTP/1.1 200 OK") — без привязки к префиксу
-  bool ok = (body.indexOf(" 200 ") >= 0);
-  Serial.printf("Ответ за %lu мс, тело %u байт -> %s\n",
-                millis() - startMs, body.length(), ok ? "OK" : "ОШИБКА");
-
-  if (!ok) {
-    // Диагностика: показываем, что реально пришло, чтобы не гадать
-    Serial.print("[debug] первые байты: ");
-    Serial.println(body.length() ? body.substring(0, 80) : String("(пусто)"));
-  }
-
-  // --- Показываем, ЧТО сервер услышал (для отладки микрофона) ---
-  if (isFinal && ok) {
-    String sttPath    = extractJsonStr(body, "stt");
-    String transcript = extractJsonStr(body, "transcript");
-    String answerText = extractJsonStr(body, "text");
-
-    Serial.println("========================================");
-    Serial.println("Путь распознавания: " +
-                   (sttPath.length() ? sttPath : String("(нет данных)")));
-    Serial.println("--- ЧТО РАСПОЗНАНО ИЗ ЗАПИСИ ---");
-    Serial.println(transcript.length() ? transcript : "(пусто)");
-    if (answerText.length()) {
-      Serial.println("--- ОТВЕТ НЕЙРОНКИ (первые 400 симв.) ---");
-      if (answerText.length() > 400) {
-        Serial.println(answerText.substring(0, 400) + "...");
-      } else {
-        Serial.println(answerText);
-      }
-    }
-    Serial.println("========================================");
-  }
-
-  return ok;
+  // --- Читаем ответ и печатаем отчёт (транскрипт/ответ — только для финала) ---
+  return readResponseAndReport(isFinal);
 }
 
 // Сессия завершилась МЕЖДУ чанками (стоп нажат во время отправки предыдущего):
@@ -277,6 +286,7 @@ void sendFinalMarkerOnly() {
     blinkLed(2, 100, 100);
     return;
   }
+  httpClient.setTimeout(30000);
 
   httpClient.printf("POST /api/voice-chunk HTTP/1.1\r\n");
   httpClient.printf("Host: %s:%d\r\n", BACKEND_HOST, BACKEND_PORT);
@@ -288,19 +298,13 @@ void sendFinalMarkerOnly() {
   httpClient.printf("Content-Length: 0\r\n");
   httpClient.printf("Connection: close\r\n\r\n");
 
-  unsigned long t = millis();
-  while (httpClient.available() < 12 && millis() - t < 8000) {
-    delay(1);
-  }
-  String statusLine = httpClient.readStringUntil('\n');
-  httpClient.stop();
-
-  if (statusLine.indexOf("200") >= 0) {
+  // Тот же полный отчёт: транскрипт накопленного + ответ нейронки
+  if (readResponseAndReport(true)) {
     blinkLed(3, 120, 120);   // успех
     Serial.println("=== Запись завершена (маркер), всё отправлено ===");
   } else {
     blinkLed(2, 100, 100);   // ошибка
-    Serial.println("Ответ сервера: " + statusLine);
+    Serial.println("Маркер не прошёл");
   }
 }
 
