@@ -157,6 +157,9 @@ bool sendChunk(bool isFinal) {
     f.close();
     return false;
   }
+  // ВАЖНО: слабый Wi-Fi + большой чанк -> блокирующая отправка дольше 5 с.
+  // Без этого сокет рвётся по внутреннему таймауту прямо посреди загрузки.
+  httpClient.setTimeout(30000);
 
   // --- HTTP-заголовки ---
   httpClient.printf("POST /api/voice-chunk HTTP/1.1\r\n");
@@ -169,17 +172,35 @@ bool sendChunk(bool isFinal) {
   httpClient.printf("Content-Length: %lu\r\n", fileSize);
   httpClient.printf("Connection: close\r\n\r\n");
 
-  // --- Стрим WAV-байтов из файла ---
+  // --- Стрим WAV-байтов из файла (с контролем каждой записи) ---
   f.seek(0);
   uint8_t buf[4096];
+  size_t totalSent = 0;
+  bool sendFail = false;
+  unsigned long upStart = millis();
   while (f.available()) {
     int n = f.read(buf, sizeof(buf));
-    if (n > 0) {
-      httpClient.write(buf, n);
+    if (n <= 0) break;
+    size_t written = httpClient.write(buf, n);
+    totalSent += written;
+    if (written != (size_t)n) {
+      Serial.printf("ОШИБКА отправки: записано %u из %d байт (итого %u/%u)\n",
+                    (unsigned)written, n, (unsigned)totalSent, (unsigned)fileSize);
+      sendFail = true;
+      break;
     }
   }
   httpClient.flush();
   f.close();
+
+  if (sendFail || totalSent != fileSize) {
+    Serial.printf("Загрузка оборвалась: отправлено %u из %u байт за %lu мс\n",
+                  (unsigned)totalSent, (unsigned)fileSize, millis() - upStart);
+    Serial.print("[debug] состояние сокета connected=");
+    Serial.println(httpClient.connected());
+    httpClient.stop();
+    return false;
+  }
 
   // --- Ждём ПЕРВЫЙ БАЙТ ответа (финальный чанк ждёт Gemini до ~10-15 c) ---
   unsigned long startMs = millis();
