@@ -181,27 +181,43 @@ bool sendChunk(bool isFinal) {
   httpClient.flush();
   f.close();
 
-  // --- Ждём и читаем ОТВЕТ ЦЕЛИКОМ: сначала HTTP-заголовки, потом JSON ---
+  // --- Ждём ПЕРВЫЙ БАЙТ ответа (финальный чанк ждёт Gemini до ~10-15 c) ---
+  unsigned long startMs = millis();
+  while (!httpClient.available() && httpClient.connected() &&
+         millis() - startMs < 15000) {
+    delay(10);
+  }
+
+  // --- Читаем всё: пока идут данные или сокет жив ---
   String body = "";
   unsigned long lastData = millis();
-  uint8_t rbuf[256];
-  while (millis() - lastData < 6000) {
-    while (httpClient.available()) {
+  uint8_t rbuf[512];
+  while (httpClient.connected() || httpClient.available()) {
+    if (httpClient.available()) {
       int n = httpClient.read(rbuf, sizeof(rbuf));
       if (n > 0) {
         body.concat((const char*)rbuf, n);
         lastData = millis();
+      } else {
+        delay(5);              // read() вернул -1 — данных в этот раз нет
       }
+      continue;
     }
-    if (!httpClient.connected()) break;   // Connection: close — сервер закрыл
+    if (millis() - lastData > 3000) break;   // тишина 3 с после потока — всё
     delay(10);
   }
   httpClient.stop();
 
-  // Статус — в первой строке тела ответа: "HTTP/1.1 200 OK"
-  bool ok = body.startsWith("HTTP/1.1 200");
-  Serial.printf("Ответ сервера: %s -> %s\n",
-                ok ? "200" : "?", ok ? "OK" : "ОШИБКА");
+  // Статус ищем по всему началу тела ("HTTP/1.1 200 OK") — без привязки к префиксу
+  bool ok = (body.indexOf(" 200 ") >= 0);
+  Serial.printf("Ответ за %lu мс, тело %u байт -> %s\n",
+                millis() - startMs, body.length(), ok ? "OK" : "ОШИБКА");
+
+  if (!ok) {
+    // Диагностика: показываем, что реально пришло, чтобы не гадать
+    Serial.print("[debug] первые байты: ");
+    Serial.println(body.length() ? body.substring(0, 80) : String("(пусто)"));
+  }
 
   // --- Показываем, ЧТО сервер услышал (для отладки микрофона) ---
   if (isFinal && ok) {
