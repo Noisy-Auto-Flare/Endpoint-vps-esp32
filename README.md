@@ -123,7 +123,7 @@ curl http://ТВОЙ_IP:8080/api/health
 | POST | `/api/photo` | Принять JPEG-фото, отправить в Gemini, сохранить ответ |
 | POST | `/api/photos` | Принять серию фото (JSON с base64), отправить в Gemini |
 | POST | `/api/voice` | Принять WAV-аудио, отправить в Gemini |
-| POST | `/api/voice-chunk` | Принять WAV-чанк (5 сек) от ESP32-C3; при `X-Final: true` склеить сессию и отправить в Gemini |
+| POST | `/api/voice-chunk` | Принять WAV-чанк (5 сек) от ESP32-C3; при `X-Final: true` склеить сессию и распознать речь: Groq Whisper → текст → Gemini (резерв: аудио сразу в Gemini) |
 | GET | `/api/latest` | Отдать последний готовый ответ (однократно) |
 
 Все эндпоинты (кроме `/api/health`) требуют заголовок `X-Device-Key`.
@@ -145,6 +145,21 @@ curl -X POST http://ТВОЙ_IP:8080/api/voice \
 curl http://ТВОЙ_IP:8080/api/latest \
   -H "X-Device-Key: твой_device_key"
 ```
+
+### Распознавание речи (STT)
+
+Голосовые сообщения по умолчанию идут через **Groq Whisper**: склеенное аудио → расшифровка в текст → текст в Gemini. Если ключ Groq не задан или сервис недоступен — автоматический резерв: аудио сразу в Gemini.
+
+Переменные `.env`:
+
+| Переменная | Значение |
+|---|---|
+| `GROQ_API_KEY` | Ключ с https://console.groq.com/keys (есть бесплатный тариф). Пусто = резервный путь |
+| `GROQ_STT_MODEL` | `whisper-large-v3` (точнее) или `whisper-large-v3-turbo` (быстрее) |
+| `GROQ_STT_LANGUAGE` | Язык распознавания, по умолчанию `ru` |
+| `STT_PROVIDER` | `groq` (по умолчанию) или `gemini` (всегда резервный путь) |
+
+Какой путь сработал — видно в ответе финального чанка (`"stt":"groq"` / `"stt":"gemini_audio"`) и в journalctl (`[stt] ...`, `source=voice_stt`).
 
 ### systemd
 

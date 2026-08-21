@@ -42,6 +42,15 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
+# --- STT (распознавание речи) через Groq Whisper ---
+# Основной путь: чанки -> склейка -> Groq Whisper (расшифровка в текст) -> Gemini (ответ).
+# Резервный путь: если GROQ_API_KEY не задан или Groq упал — аудио сразу в Gemini.
+STT_PROVIDER = os.environ.get("STT_PROVIDER", "groq")            # groq | gemini
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
+GROQ_STT_LANGUAGE = os.environ.get("GROQ_STT_LANGUAGE", "ru")
+GROQ_API_BASE = "https://api.groq.com/openai/v1"
+
 # Системный промпт для голосовых запросов (можно менять под задачу)
 VOICE_SYSTEM_PROMPT = os.environ.get(
     "VOICE_SYSTEM_PROMPT",
@@ -184,6 +193,28 @@ def merge_wav_chunks(chunks: list) -> bytes:
         total_data_size,
     )
     return header + b"".join(data_parts)
+
+
+def transcribe_groq(wav_bytes: bytes) -> str:
+    """
+    Расшифровывает WAV в текст через Groq Whisper (OpenAI-совместимый API).
+
+    Формат от прошивки (16 кГц, 16 бит, моно) Whisper принимает как есть.
+    Бросает исключение при любой ошибке — вызывающий код уходит в резервный путь.
+    """
+    resp = requests.post(
+        f"{GROQ_API_BASE}/audio/transcriptions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+        data={
+            "model": GROQ_STT_MODEL,
+            "language": GROQ_STT_LANGUAGE,
+            "response_format": "json",
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    return (resp.json().get("text") or "").strip()
 
 
 # ---------------------------------------------------------------------
@@ -338,20 +369,44 @@ def handle_voice_chunk():
     except RuntimeError as e:
         return jsonify({"error": f"failed to merge chunks: {e}"}), 400
 
-    audio_b64 = base64.b64encode(merged_audio).decode("utf-8")
+    # --- Основной путь: Groq Whisper (расшифровка) -> текст -> Gemini ---
+    stt_used = False
+    transcript = ""
+    if STT_PROVIDER == "groq" and GROQ_API_KEY:
+        try:
+            transcript = transcribe_groq(merged_audio)
+            if transcript:
+                stt_used = True
+                print(f"[stt] groq ok, model={GROQ_STT_MODEL} len={len(transcript)} "
+                      f"preview={transcript[:100]!r}", flush=True)
+            else:
+                print("[stt] groq вернул пустой текст; fallback на Gemini audio", flush=True)
+        except (requests.RequestException, ValueError) as e:
+            print(f"[stt] groq упал ({e}); fallback на Gemini audio", flush=True)
 
     try:
-        answer = call_gemini(
-            VOICE_SYSTEM_PROMPT,
-            [
-                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
-            ],
-        )
+        if stt_used:
+            # В нейронку уходит готовая расшифровка текстом
+            answer = call_gemini(
+                VOICE_SYSTEM_PROMPT,
+                [{"text": f"Голосовое сообщение пользователя (расшифровка речи):\n{transcript}"}],
+            )
+        else:
+            # Резервный путь: склеенное аудио напрямую в Gemini
+            audio_b64 = base64.b64encode(merged_audio).decode("utf-8")
+            answer = call_gemini(
+                VOICE_SYSTEM_PROMPT,
+                [
+                    {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                ],
+            )
     except (requests.RequestException, RuntimeError) as e:
         return jsonify({"error": f"gemini request failed: {e}"}), 502
 
-    set_latest_result(answer, source="voice_chunks")
-    return jsonify({"ok": True, "final": True, "text": answer})
+    set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
+    return jsonify({"ok": True, "final": True,
+                    "stt": "groq" if stt_used else "gemini_audio",
+                    "text": answer})
 
 
 # ---------------------------------------------------------------------
