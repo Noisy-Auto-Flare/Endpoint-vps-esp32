@@ -45,9 +45,14 @@ GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # Системный промпт для голосовых запросов (можно менять под задачу)
 VOICE_SYSTEM_PROMPT = os.environ.get(
     "VOICE_SYSTEM_PROMPT",
-    "Ты — голосовой ассистент на маленьком устройстве с экраном 128x64 (8 строк по 21 символу). "
-    "Тебе присылают аудио с голосовым сообщением пользователя. Ответь на то, что он сказал/спросил. "
-    "Отвечай кратко, по существу, без markdown-разметки, желательно уложиться в 2-3 коротких предложения."
+    "Ты — голосовой ассистент на маленьком устройстве с экраном 128x64. "
+    "Тебе присылают аудио с голосовым вопросом пользователя. "
+    "СРАЗУ давай конечный ответ по существу, без вступлений и размышлений вслух: "
+    "запрещены фразы вроде «хорошо», «сейчас посчитаю», «я сделаю поэтапный список», "
+    "описание шагов решения и любые рассуждения — только итоговый результат. "
+    "Если просят что-то посчитать — выдай только готовый ответ (число/факт). "
+    "Без markdown-разметки и любых специальных символов. "
+    "Максимум 1-2 коротких предложения."
 )
 
 # Системный промпт для фото-запросов
@@ -93,6 +98,8 @@ def set_latest_result(text: str, source: str):
         _state["text"] = text
         _state["source"] = source
         _state["created_at"] = time.time()
+    # Краткий лог ответа — виден в journalctl, упрощает отладку
+    print(f"[answer] source={source} len={len(text)} preview={text[:100]!r}", flush=True)
 
 
 def call_gemini(system_prompt: str, parts: list) -> str:
@@ -119,8 +126,16 @@ def call_gemini(system_prompt: str, parts: list) -> str:
         raise RuntimeError(f"Пустой ответ от Gemini: {data}")
 
     content_parts = candidates[0].get("content", {}).get("parts", [])
-    text_chunks = [p.get("text", "") for p in content_parts if "text" in p]
-    return "".join(text_chunks).strip()
+    # Берём ТОЛЬКО финальный текст: части с "thought": true — это внутренние
+    # размышления модели, пользователю они не нужны.
+    text_chunks = [
+        p.get("text", "") for p in content_parts
+        if "text" in p and not p.get("thought")
+    ]
+    answer = "".join(text_chunks).strip()
+    if not answer:
+        raise RuntimeError(f"Пустой ответ от Gemini: {data}")
+    return answer
 
 
 def merge_wav_chunks(chunks: list) -> bytes:
