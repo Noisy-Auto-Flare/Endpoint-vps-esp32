@@ -83,6 +83,8 @@
 #define BUTTON_DEBOUNCE_MS 300
 #define BUTTON_LONG_PRESS_MS 1500
 #define FLASH_LED_PIN 4
+// v2: тихий режим — вспышка на захвате только если true
+#define FLASH_ON_CAPTURE false
 
 // Целевой интервал между кадрами при записи "видео" (кадр-последовательности)
 // SD-карта на 1-битном режиме ESP32-CAM не очень быстрая, поэтому не гонимся
@@ -294,8 +296,72 @@ String sendPhotoToBackend() {
 }
 
 // ---------------------------------------------------------------------
+// v2: одиночный кадр сразу в staging — POST /api/photo-frame (raw JPEG).
+// Сервер только складывает в staging, в нейронку НЕ отправляет.
+// Возвращает true только при HTTP 200. Без base64/JSON, без локальной копии.
+// ---------------------------------------------------------------------
+bool sendFrameToBackend() {
+  ensureCaptureQuality();
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("sendFrame: не удалось получить кадр с камеры");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = "http://" + String(BACKEND_HOST) + ":" + String(BACKEND_PORT) + "/api/photo-frame";
+
+  http.begin(url);
+  http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.setTimeout(30000);
+
+  int httpCode = http.POST(fb->buf, fb->len);
+  String payload = http.getString();
+  Serial.println("sendFrame HTTP " + String(httpCode) + " " + payload);
+
+  http.end();
+  esp_camera_fb_return(fb);
+  return (httpCode == 200);
+}
+
+// ---------------------------------------------------------------------
+// v2: коммит staging — POST /api/photos/commit с пустым телом.
+// Сервер забирает все staged-кадры и отправляет в Gemini одним запросом.
+// Возвращает HTTP status code; тело ответа кладётся в out-param body.
+// 200 = успех (тело может содержать слово "error" в прозе ответа —
+// это НЕ признак неудачи, решаем только по коду), 400 = пустой staging,
+// прочие (502/транспортные <0) = ошибка сервера/сети.
+// ---------------------------------------------------------------------
+int sendCommitToBackend(String &body) {
+  HTTPClient http;
+  String url = "http://" + String(BACKEND_HOST) + ":" + String(BACKEND_PORT) + "/api/photos/commit";
+
+  http.begin(url);
+  http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.setTimeout(60000);
+
+  int httpCode = http.POST(String(""));
+  String result;
+
+  if (httpCode == 200) {
+    result = http.getString();
+    Serial.println("Ответ бэкенда (commit): " + result);
+  } else {
+    result = "{\"error\":\"HTTP " + String(httpCode) + " " + http.getString() + "\"}";
+    Serial.println(result);
+  }
+
+  http.end();
+  body = result;
+  return httpCode;
+}
+
+// ---------------------------------------------------------------------
 // Серийная съёмка: захват кадра в память (не на SD), очистка серии,
 // отправка всей накопленной серии на бэкенд одним запросом
+// v2: этот burst-флоу оставлен только для веб-страницы (/burst_*);
+// физическая кнопка теперь использует sendFrameToBackend/sendCommitToBackend.
 // ---------------------------------------------------------------------
 void freeBurstBuffers() {
   for (int i = 0; i < burstCount; i++) {
@@ -682,7 +748,9 @@ void loop() {
 
   unsigned long now = millis();
 
-  // Физическая кнопка: короткое нажатие = фото в серию, длинное удержание = отправка
+  // v2: короткое нажатие = один кадр сразу в staging, длинное удержание = коммит.
+  // (Старый burst-флоу через captureIntoBurst/sendBurstToBackend оставлен только
+  // для веб-страницы; физическая кнопка его больше не использует.)
   bool buttonIsPressed = (digitalRead(SHUTTER_BUTTON_PIN) == LOW);
 
   // Falling edge — кнопка нажата
@@ -697,30 +765,43 @@ void loop() {
     buttonWasPressed = false;
     unsigned long pressDuration = now - pressTime;
     if (pressDuration >= BUTTON_DEBOUNCE_MS && pressDuration < BUTTON_LONG_PRESS_MS) {
-      // Короткое нажатие: фото в серию
-      if (captureIntoBurst()) {
-        Serial.println("Кнопка: кадр добавлен в серию (" + String(burstCount) + "/" + String(BURST_MAX_PHOTOS) + ")");
+      // v2: короткое нажатие — снять ОДИН кадр и сразу POST /api/photo-frame
+      bool ok = sendFrameToBackend();
+      if (ok) {
+        Serial.println("Кнопка: кадр отправлен в staging");
+        // 1x = кадр принят: яркая вспышка только если разрешена, иначе тихий блип
+        if (FLASH_ON_CAPTURE) {
+          digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW);
+        } else {
+          digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
+        }
+      } else {
+        Serial.println("Кнопка: ошибка отправки кадра");
+        // 2x = ошибка отправки
+        for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
       }
-      // Мигнуть вспышкой 1 раз
-      digitalWrite(FLASH_LED_PIN, HIGH); delay(50); digitalWrite(FLASH_LED_PIN, LOW);
     }
   }
 
-  // Длинное удержание — отправка серии
+  // Длинное удержание — v2: ВСЕГДА коммит (решение о пустом staging принимает сервер).
+  // Успех решаем СТРОГО по HTTP-коду (ответ 200 может содержать слово "error"
+  // в прозе Gemini — это не неудача): 200 = 3x блика, 400 = пустой staging =
+  // 1x короткий блик, прочее = 2x блика (ошибка сервера/сети).
   if (buttonIsPressed && buttonWasPressed && !longPressHandled && (now - pressTime >= BUTTON_LONG_PRESS_MS)) {
     longPressHandled = true;
-    if (burstCount == 0) {
-      // Буфер пуст: мигнуть вспышкой 1× коротко
-      for (int i=0; i<1; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
+    String commitBody;
+    int commitCode = sendCommitToBackend(commitBody);
+    if (commitCode == 200) {
+      // Успешный коммит: мигнуть 3×
+      for (int i=0; i<3; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
+    } else if (commitCode == 400) {
+      // Пустой staging (сервер: no staged frames): один короткий блик
+      Serial.println("Кнопка: коммит отклонён — staging пуст (HTTP 400)");
+      digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
     } else {
-      String result = sendBurstToBackend();
-      if (result.indexOf("error") >= 0) {
-        // Ошибка: мигнуть вспышкой 2×
-        for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
-      } else {
-        // Успех: мигнуть вспышкой 3×
-        for (int i=0; i<3; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
-      }
+      // Ошибка Gemini/сети: мигнуть 2×
+      Serial.println("Кнопка: ошибка коммита, HTTP " + String(commitCode));
+      for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
     }
   }
 
