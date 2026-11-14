@@ -114,6 +114,10 @@ MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", str(8 * 1024 * 102
 PHOTO_FRAME_MAX_BYTES = int(os.environ.get("PHOTO_FRAME_MAX_BYTES", str(2 * 1024 * 1024)))
 PHOTOS_MAX_IMAGES = int(os.environ.get("PHOTOS_MAX_IMAGES", "10"))
 PHOTOS_MAX_TOTAL_B64 = int(os.environ.get("PHOTOS_MAX_TOTAL_B64", str(6 * 1024 * 1024)))
+# Кап ответа для microReader: ESP8266 держит ответ+копию транзиентно (getString),
+# файл лежит в LittleFS 2MB — без капа безграничная проза Gemini единственный
+# безграничный аллок. Обрезка пост-фактум, промпты не трогаем.
+MAX_ANSWER_CHARS = int(os.environ.get("MAX_ANSWER_CHARS", "8000"))
 
 # =====================================================================
 
@@ -195,6 +199,13 @@ def _is_voice_source(source: str) -> bool:
 def set_latest_result(text: str, source: str):
     global _answer_seq
     now = time.time()
+    orig_len = len(text)
+    if orig_len > MAX_ANSWER_CHARS:
+        text = text[:MAX_ANSWER_CHARS] + "…"
+        print(f"[answer] source={source} len={orig_len} truncated_len={len(text)} "
+              f"cap={MAX_ANSWER_CHARS} preview={text[:100]!r}", flush=True)
+    else:
+        print(f"[answer] source={source} len={orig_len} preview={text[:100]!r}", flush=True)
     with _state_lock:
         _answer_seq += 1
         slot = _voice_answer if _is_voice_source(source) else _photo_answer
@@ -203,7 +214,7 @@ def set_latest_result(text: str, source: str):
         slot["source"] = source
         slot["created_at"] = now
         slot["seq"] = _answer_seq
-    print(f"[answer] source={source} len={len(text)} preview={text[:100]!r}", flush=True)
+    return text
 
 
 def _newest_ready_slot_locked():
@@ -262,6 +273,41 @@ def call_gemini(system_prompt: str, parts: list) -> str:
     return answer
 
 
+def _wav_data_offset(chunk: bytes) -> int:
+    if len(chunk) < 12 or chunk[0:4] != b"RIFF" or chunk[8:12] != b"WAVE":
+        raise RuntimeError(
+            f"unsupported wav format: bad RIFF/WAVE magic "
+            f"riff={chunk[0:4]!r} wave={chunk[8:12]!r} len={len(chunk)}"
+        )
+    offset = 12
+    fmt_seen = None
+    while offset + 8 <= len(chunk):
+        sub_id = chunk[offset:offset + 4]
+        (sub_size,) = struct.unpack("<I", chunk[offset + 4:offset + 8])
+        if sub_id == b"fmt ":
+            if len(chunk) < offset + 8 + 16:
+                raise RuntimeError("unsupported wav format: truncated fmt chunk")
+            (audio_fmt, channels, rate, _br, _ba, bits) = struct.unpack(
+                "<HHIIHH", chunk[offset + 8:offset + 24])
+            fmt_seen = (audio_fmt, channels, rate, bits)
+            if (audio_fmt, channels, rate, bits) != (1, 1, 16000, 16):
+                raise RuntimeError(
+                    f"unsupported wav format: fmt={audio_fmt} channels={channels} "
+                    f"rate={rate} bits={bits}"
+                )
+        elif sub_id == b"data":
+            if fmt_seen is None:
+                raise RuntimeError("unsupported wav format: data before fmt")
+            if fmt_seen != (1, 1, 16000, 16):
+                raise RuntimeError(
+                    f"unsupported wav format: fmt={fmt_seen[0]} channels={fmt_seen[1]} "
+                    f"rate={fmt_seen[2]} bits={fmt_seen[3]}"
+                )
+            return offset + 8
+        offset += 8 + sub_size + (sub_size & 1)
+    raise RuntimeError("unsupported wav format: data subchunk not found")
+
+
 def merge_wav_chunks(chunks: list) -> bytes:
     """
     Склеивает несколько WAV-файлов (16 кГц, 16 бит, моно) в один WAV.
@@ -277,8 +323,13 @@ def merge_wav_chunks(chunks: list) -> bytes:
     for chunk in chunks:
         if len(chunk) <= 44:
             continue  # пустой финальный маркер или заголовок без данных
-        data_parts.append(chunk[44:])  # отрезаем заголовок
-        total_data_size += len(chunk) - 44
+        data_off = _wav_data_offset(chunk)
+        if data_off != 44:
+            raise RuntimeError(
+                f"unsupported wav format: unexpected data offset={data_off} len={len(chunk)}"
+            )
+        data_parts.append(chunk[data_off:])
+        total_data_size += len(chunk) - data_off
 
     if total_data_size == 0:
         raise RuntimeError("chunks contain no audio data")
@@ -418,7 +469,7 @@ def handle_photo():
     dt_ms = int((time.monotonic() - t0) * 1000)
     print(f"[gemini] photo ok ms={dt_ms} bytes={len(image_bytes)}", flush=True)
 
-    set_latest_result(answer, source="photo")
+    answer = set_latest_result(answer, source="photo")
     return jsonify({"ok": True, "text": answer})
 
 
@@ -460,7 +511,7 @@ def handle_photos():
     dt_ms = int((time.monotonic() - t0) * 1000)
     print(f"[gemini] photos ok ms={dt_ms} n={len(images_b64)}", flush=True)
 
-    set_latest_result(answer, source="photos_burst")
+    answer = set_latest_result(answer, source="photos_burst")
     return jsonify({"ok": True, "text": answer})
 
 
@@ -485,7 +536,7 @@ def handle_voice():
     except (requests.RequestException, RuntimeError):
         return jsonify({"error": "gemini request failed"}), 502
 
-    set_latest_result(answer, source="voice")
+    answer = set_latest_result(answer, source="voice")
     return jsonify({"ok": True, "text": answer})
 
 
@@ -596,7 +647,7 @@ def handle_voice_chunk():
         except (requests.RequestException, RuntimeError):
             return jsonify({"error": "gemini request failed"}), 502
 
-        set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
+        answer = set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
         return jsonify({"ok": True, "final": True,
                         "stt": "groq" if stt_used else "gemini_direct",
                         "transcript": transcript,
@@ -715,7 +766,7 @@ def handle_photos_commit():
         print(f"[gemini] commit ok ms={dt_ms} frames={len(frames)}", flush=True)
 
         total_bytes = sum(len(f) for f in frames)
-        set_latest_result(answer, source="photos_commit")
+        answer = set_latest_result(answer, source="photos_commit")
         with _state_lock:
             _last_commit_failed = False
         with _photo_lock:

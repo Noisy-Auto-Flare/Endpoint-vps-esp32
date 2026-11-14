@@ -9,6 +9,7 @@ import base64
 import importlib
 import json
 import os
+import struct
 import sys
 import time
 import unittest
@@ -24,9 +25,21 @@ HEADERS = {"X-Device-Key": DEVICE_KEY}
 FAKE_JPEG = b"\xff\xd8\xff fake-jpeg-bytes \xff\xd9"
 
 
-def _wav(payload_len=1600):
-    """Deterministic fake WAV chunk: 44-byte header + payload."""
-    return b"H" * 44 + b"\x01\x02" * payload_len
+def _build_wav(payload: bytes, rate=16000, channels=1, bits=16, audio_fmt=1,
+               extra_before_data: bytes = b"", riff: bytes = b"RIFF", wave: bytes = b"WAVE"):
+    """Build a WAV file; canonical 44B header when defaults are used."""
+    byte_rate = rate * channels * bits // 8
+    block_align = channels * bits // 8
+    fmt_chunk = b"fmt " + struct.pack("<IHHIIHH", 16, audio_fmt, channels,
+                                      rate, byte_rate, block_align, bits)
+    chunks = fmt_chunk + extra_before_data + b"data" + struct.pack("<I", len(payload))
+    size = 4 + len(chunks) + len(payload)
+    return riff + struct.pack("<I", size) + wave + chunks + payload
+
+
+def _wav(payload_len=1600, **kw):
+    """Deterministic fake WAV chunk: 44-byte canonical header + payload."""
+    return _build_wav(b"\x01\x02" * payload_len, **kw)
 
 
 def fresh_app(groq_enabled=False):
@@ -384,6 +397,98 @@ class StartupGuardTest(unittest.TestCase):
     @unittest.skip("startup guard lives under __main__-only; not importable without subprocess")
     def test_startup_guard_untestable(self):
         pass
+
+
+class MaxAnswerCharsTest(unittest.TestCase):
+    def test_env_knob_default_8000(self):
+        os.environ.pop("MAX_ANSWER_CHARS", None)
+        mod, _ = fresh_app()
+        self.assertEqual(mod.MAX_ANSWER_CHARS, 8000)
+
+    def test_long_answer_truncated_with_marker(self):
+        mod, _ = fresh_app()
+        mod.MAX_ANSWER_CHARS = 10
+        stored = mod.set_latest_result("x" * 50, source="photo")
+        self.assertEqual(stored, "x" * 10 + "…")
+        self.assertTrue(mod._photo_answer["text"].endswith("…"))
+        self.assertEqual(len(mod._photo_answer["text"]), 11)
+
+    def test_short_answer_untouched(self):
+        mod, _ = fresh_app()
+        mod.MAX_ANSWER_CHARS = 10
+        stored = mod.set_latest_result("short", source="voice")
+        self.assertEqual(stored, "short")
+        self.assertFalse(stored.endswith("…"))
+
+    def test_commit_path_returns_truncated(self):
+        mod, client = fresh_app()
+        mod.MAX_ANSWER_CHARS = 5
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", return_value="y" * 50):
+            resp = client.post("/api/photos/commit", headers=HEADERS)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["text"], "y" * 5 + "…")
+        latest = json.loads(client.get("/api/latest", headers=HEADERS).get_data(as_text=True))
+        self.assertEqual(latest["text"], "y" * 5 + "…")
+
+    def test_voice_path_returns_truncated(self):
+        mod, client = fresh_app()
+        mod.MAX_ANSWER_CHARS = 5
+        vheaders = dict(HEADERS, **{
+            "X-Session-Id": "trunc1",
+            "X-Chunk-Index": "0",
+            "X-Final": "true",
+            "Content-Type": "audio/wav",
+        })
+        with mock.patch.object(mod, "call_gemini", return_value="z" * 50):
+            resp = client.post("/api/voice-chunk", headers=vheaders, data=_wav())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["text"], "z" * 5 + "…")
+
+
+class WavValidationTest(unittest.TestCase):
+    def test_merge_valid_two_chunks(self):
+        mod, _ = fresh_app()
+        c1, c2 = _wav(100), _wav(200)
+        out = mod.merge_wav_chunks([c1, c2])
+        self.assertEqual(out[0:4], b"RIFF")
+        self.assertEqual(out[8:12], b"WAVE")
+        self.assertEqual(out[44:], c1[44:] + c2[44:])
+
+    def test_non_riff_raises(self):
+        mod, _ = fresh_app()
+        bad = b"XXXX" + _wav(10)[4:]
+        with self.assertRaises(RuntimeError) as cm:
+            mod.merge_wav_chunks([bad])
+        self.assertIn("unsupported wav format", str(cm.exception))
+
+    def test_wrong_rate_raises_naming_value(self):
+        mod, _ = fresh_app()
+        bad = _wav(10, rate=8000)
+        with self.assertRaises(RuntimeError) as cm:
+            mod.merge_wav_chunks([bad])
+        self.assertIn("unsupported wav format", str(cm.exception))
+        self.assertIn("8000", str(cm.exception))
+
+    def test_list_before_data_raises(self):
+        mod, _ = fresh_app()
+        extra = b"LIST" + struct.pack("<I", 4) + b"abcd"
+        bad = _build_wav(b"\x01\x02" * 10, extra_before_data=extra)
+        with self.assertRaises(RuntimeError) as cm:
+            mod.merge_wav_chunks([bad])
+        self.assertIn("unsupported wav format", str(cm.exception))
+
+    def test_voice_chunk_garbage_400(self):
+        _, client = fresh_app()
+        vheaders = dict(HEADERS, **{
+            "X-Session-Id": "garbage1",
+            "X-Chunk-Index": "0",
+            "X-Final": "true",
+            "Content-Type": "audio/wav",
+        })
+        resp = client.post("/api/voice-chunk", headers=vheaders, data=b"GARBAGE" * 20)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.get_json())
 
 
 if __name__ == "__main__":
