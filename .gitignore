@@ -27,5 +27,7 @@ microReader-repo/
 # Служебные файлы агента (не часть проекта)
 .omo/
 
-# Arduino build artifacts
-microreader/firmware/a-microReader-v1.2/build/
+# Arduino build artifacts (generic: any firmware build/ dir)
+microreader/firmware/**/build/
+esp32-cam/**/build/
+esp32-c3/**/build/
