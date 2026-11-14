@@ -148,7 +148,6 @@ uint8_t* burstBuf[BURST_MAX_PHOTOS];
 size_t   burstLen[BURST_MAX_PHOTOS];
 int burstCount = 0;
 
-unsigned long lastButtonPressMs = 0;
 static bool buttonWasPressed = false;
 static unsigned long pressTime = 0;
 static bool longPressHandled = false;
