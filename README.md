@@ -210,13 +210,19 @@ sudo systemctl status shpora-backend
 
 ### Прошивка
 
-1. Открой `microreader/firmware/a-microReader-v1.2/a-microReader-v1.2.ino` в Arduino IDE
-2. Установи ядро ESP8266 v3.1.2 (или новее)
-3. Скопируй библиотеки из оригинального репозитория [Nich1con/microReader](https://github.com/Nich1con/microReader) (`libraries/`) в свою папку libraries с заменой
-4. Настройки платы: Generic ESP8266 Module, Flash Size: 4M (FS:2MB OTA:~1019KB)
-5. Залей прошивку
+Актуальная версия: **v1.3** (`microreader/firmware/a-microReader-v1.3/`, меню ответов + мониторинг).
+Готовый бинарь: `microreader/firmware/a-microReader-v1.3.bin` (в гит не коммитится, собирай локально).
 
-> ⚠️ **Важно**: если файловая система показывает ~64 КБ вместо 2 МБ — прошивка была собрана с неверным `Flash Size`. Перепрошей через USB один раз с `Flash Size: 4M (FS:2MB OTA:~1019KB)` и `Erase Flash: All flash`, чтобы пересоздать разметку. Дальше обновляй через OTA.
+1. Открой `microreader/firmware/a-microReader-v1.3/a-microReader-v1.3.ino` в Arduino IDE
+2. Ядро ESP8266 **v3.1.2** (как у оригинала [Nich1con/microReader](https://github.com/Nich1con/microReader))
+3. Скопируй библиотеки из оригинального репозитория (`libraries/`) в свою папку libraries с заменой
+4. Плата **Generic ESP8266 Module**, точные настройки (проверены по `boards.txt` ядра 3.1.2):
+   - Upload Speed: 921600, CPU Frequency: 80MHz
+   - Flash Size: **4M (FS:2MB OTA:~1019KB)** — это чип 4 МБ: скетч до 1 МБ, OTA-слот ~1019 КБ, FS 2 МБ (0x200000–0x3FA000)
+   - Остальное по умолчанию; для первой прошивки с другой разметки — Erase Flash: All flash
+5. Залей прошивку (наш `.bin` ~500 КБ < 1019 КБ — в OTA-лимит входит с запасом)
+
+> ⚠️ **Важно**: если файловая система показывает ~64 КБ вместо 2 МБ — прошивка была собрана с неверным `Flash Size` (например, 1M-вариант с FS 64K). Лечится только перепрошивкой по USB один раз с `Flash Size: 4M (FS:2MB OTA:~1019KB)` и `Erase Flash: All flash` — иначе старая разметка остаётся на неверном смещении. Дальше обновляй через OTA.
 
 ### Настройка
 
