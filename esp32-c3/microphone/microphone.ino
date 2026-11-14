@@ -375,9 +375,12 @@ sessionEnd:;
 // ========================= ОТПРАВКА НА СЕРВЕР =============================
 
 bool readResponseAndReport(bool expectReport) {
+  // Худший случай сервера: Groq 60с + Gemini 60с последовательно (~120с), запас до 150с для финала
+  const unsigned long firstByteMs = expectReport ? 150000 : 15000;
+  const unsigned long idleMs = expectReport ? 10000 : 2000;
   unsigned long startMs = millis();
   while (!httpClient.available() && httpClient.connected() &&
-         millis() - startMs < 20000) {
+         millis() - startMs < firstByteMs) {
     delay(10);
   }
 
@@ -395,7 +398,7 @@ bool readResponseAndReport(bool expectReport) {
       }
       continue;
     }
-    if (millis() - lastData > 3000) break;
+    if (millis() - lastData > idleMs) break;
     delay(10);
   }
   httpClient.stop();

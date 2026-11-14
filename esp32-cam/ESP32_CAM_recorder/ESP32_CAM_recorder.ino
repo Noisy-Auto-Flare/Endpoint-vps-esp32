@@ -339,7 +339,8 @@ int sendCommitToBackend(String &body) {
 
   http.begin(url);
   http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
-  http.setTimeout(60000);
+  // Худший случай сервера: Groq 60с + Gemini 60с последовательно (~120с), запас до 150с
+  http.setTimeout(150000);
 
   int httpCode = http.POST(String(""));
   String result;
@@ -786,7 +787,8 @@ void loop() {
   // Длинное удержание — v2: ВСЕГДА коммит (решение о пустом staging принимает сервер).
   // Успех решаем СТРОГО по HTTP-коду (ответ 200 может содержать слово "error"
   // в прозе Gemini — это не неудача): 200 = 3x блика, 400 = пустой staging =
-  // 1x короткий блик, прочее = 2x блика (ошибка сервера/сети).
+  // 1x короткий блик, 429 = сервер занят (конкурентный коммит) = 4x быстрых,
+  // прочее = 2x блика (ошибка сервера/сети).
   if (buttonIsPressed && buttonWasPressed && !longPressHandled && (now - pressTime >= BUTTON_LONG_PRESS_MS)) {
     longPressHandled = true;
     String commitBody;
@@ -798,6 +800,10 @@ void loop() {
       // Пустой staging (сервер: no staged frames): один короткий блик
       Serial.println("Кнопка: коммит отклонён — staging пуст (HTTP 400)");
       digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
+    } else if (commitCode == 429) {
+      // Сервер занят (конкурентный коммит): 4x быстрых — подожди и повтори позже
+      Serial.println("Кнопка: сервер занят (HTTP 429) — подожди и повтори позже");
+      for (int i=0; i<4; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(80); digitalWrite(FLASH_LED_PIN, LOW); delay(80); }
     } else {
       // Ошибка Gemini/сети: мигнуть 2×
       Serial.println("Кнопка: ошибка коммита, HTTP " + String(commitCode));

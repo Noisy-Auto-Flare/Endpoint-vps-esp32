@@ -160,8 +160,8 @@ String photoStatusRu(const String& s) {
 }
 
 // Опрос GET /api/photo-status. Возвращает true при HTTP 200.
-// На выходе: staged, photoStatus, answerReady.
-bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
+// На выходе: staged, photoStatus, answerReady, voiceBusy (missing key = false).
+bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy) {
     WiFiClient client;
     HTTPClient http;
     String url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/photo-status";
@@ -188,6 +188,12 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
             }
         }
         answerReady = response.indexOf("\"answer_ready\":true") >= 0;
+        // voice_busy опционален: нет ключа = false; допуск пробелов после ":".
+        voiceBusy = false;
+        int pVb = response.indexOf("\"voice_busy\"");
+        if (pVb >= 0) {
+            voiceBusy = response.substring(pVb + 12, pVb + 12 + 6).indexOf("true") >= 0;
+        }
         ok = true;
     } else {
         oled.clear(); oled.home();
@@ -198,6 +204,12 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
 
     http.end();
     return ok;
+}
+
+// Совместимость со старым меню статуса (без voice_busy).
+bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
+    bool dummyBusy = false;
+    return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy);
 }
 
 // Окно статуса фото: 4 строки.

@@ -102,6 +102,7 @@ void enterMonitorMenu() {
   bool monReady = false;
   int staged = 0;
   String photoStatus = "idle";
+  bool voiceBusy = false;
   int ansCursor = 0;
   unsigned long enterTime = millis();
   unsigned long lastPoll = 0;
@@ -168,6 +169,7 @@ void enterMonitorMenu() {
           monReady = false;
           monLineCount = 1;
           monLines[0] = "кадров на сервере: " + String(staged);
+          if (voiceBusy && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
         }
         ansCursor = constrain(ansCursor, 0, monLineCount);
         lastPoll = millis();
@@ -202,11 +204,12 @@ void enterMonitorMenu() {
             } else {
               monitoring = true;
               bool answerReady = false;
-              if (fetchPhotoStatus(staged, photoStatus, answerReady)) {
+              if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
                 monReady = answerReady;
                 monLineCount = 0;
                 monLines[monLineCount++] = "кадров на сервере: " + String(staged);
                 if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
+                else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
               } else {
                 monReady = false;
                 monLineCount = 1;
@@ -234,11 +237,12 @@ void enterMonitorMenu() {
     if (monitoring && millis() - lastPoll >= 1000) {
       lastPoll = millis();
       bool answerReady = false;
-      if (fetchPhotoStatus(staged, photoStatus, answerReady)) {
+      if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
         monReady = answerReady;
         monLineCount = 0;
         monLines[monLineCount++] = "кадров на сервере: " + String(staged);
         if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
+        else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
       } else {
         monReady = false;
         monLineCount = 1;
