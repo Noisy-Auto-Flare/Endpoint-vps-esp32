@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -298,6 +299,91 @@ class OversizeFrameTest(unittest.TestCase):
         resp = client.post("/api/photo-frame", headers=HEADERS, data=b"x" * 100)
         self.assertEqual(resp.status_code, 413)
         self.assertIn("error", resp.get_json())
+
+
+class PhotoMaxBytesTest(unittest.TestCase):
+    def test_photo_too_large_413(self):
+        mod, client = fresh_app()
+        setattr(mod, "PHOTO_MAX_BYTES", 10)
+        with mock.patch.object(mod, "call_gemini") as m:
+            resp = client.post("/api/photo", headers=HEADERS, data=b"x" * 100)
+        self.assertEqual(resp.status_code, 413)
+        self.assertIn("error", resp.get_json())
+        self.assertEqual(m.call_count, 0)
+
+
+class VoiceMaxBytesTest(unittest.TestCase):
+    def test_voice_too_large_413(self):
+        mod, client = fresh_app()
+        setattr(mod, "VOICE_MAX_BYTES", 10)
+        with mock.patch.object(mod, "call_gemini") as m:
+            resp = client.post("/api/voice", headers=HEADERS, data=b"x" * 100)
+        self.assertEqual(resp.status_code, 413)
+        self.assertIn("error", resp.get_json())
+        self.assertEqual(m.call_count, 0)
+
+
+class VoiceSessionsCapTest(unittest.TestCase):
+    def _chunk_headers(self, sid):
+        return dict(HEADERS, **{
+            "X-Session-Id": sid,
+            "X-Chunk-Index": "0",
+            "Content-Type": "audio/wav",
+        })
+
+    def test_new_session_beyond_cap_413_no_state_change(self):
+        mod, client = fresh_app()
+        setattr(mod, "VOICE_MAX_SESSIONS", 1)
+        r1 = client.post("/api/voice-chunk", headers=self._chunk_headers("s-cap-1"), data=_wav())
+        self.assertEqual(r1.status_code, 200)
+        before = dict(mod._voice_sessions)
+        r2 = client.post("/api/voice-chunk", headers=self._chunk_headers("s-cap-2"), data=_wav())
+        self.assertEqual(r2.status_code, 413)
+        self.assertIn("error", r2.get_json())
+        self.assertEqual(len(mod._voice_sessions), 1)
+        self.assertNotIn("s-cap-2", mod._voice_sessions)
+        self.assertIn("s-cap-1", mod._voice_sessions)
+        self.assertEqual(mod._voice_sessions["s-cap-1"], before["s-cap-1"])
+
+
+class LegacyPhotosValidationTest(unittest.TestCase):
+    def test_photos_non_str_400(self):
+        mod, client = fresh_app()
+        with mock.patch.object(mod, "call_gemini") as m:
+            resp = client.post("/api/photos", headers=HEADERS,
+                               json={"images": ["aGVsbG8=", 123]})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.get_json())
+        self.assertEqual(m.call_count, 0)
+
+
+class CommitPrefixSurvivalTest(unittest.TestCase):
+    def test_frame_staged_during_commit_survives(self):
+        mod, client = fresh_app()
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+
+        def slow_gemini(system_prompt, parts):
+            with mod._photo_lock:
+                mod._photo_staging.append((FAKE_JPEG, time.time()))
+            return "canned-survivor"
+
+        with mock.patch.object(mod, "call_gemini", side_effect=slow_gemini):
+            resp = client.post("/api/photos/commit", headers=HEADERS)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["frames"], 1)
+        self.assertEqual(body["text"], "canned-survivor")
+        status = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(status["staged"], 1)
+        self.assertEqual(status["photo_status"], "txt_ready")
+        self.assertTrue(status["answer_ready"])
+
+
+class StartupGuardTest(unittest.TestCase):
+    @unittest.skip("startup guard lives under __main__-only; not importable without subprocess")
+    def test_startup_guard_untestable(self):
+        pass
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@
 
 import argparse
 import base64
+import hmac
 import os
 import struct
 import sys
@@ -101,9 +102,12 @@ PHOTO_SYSTEM_PROMPT = os.environ.get(
 
 # Голосовые сессии ESP32-C3: накопление чанков по 5 секунд,
 # склейка в один WAV и отправка в Gemini при приходе финального чанка.
-VOICE_SESSION_TTL = 600          # секунд: сессия без финального чанка сгорает
-VOICE_MAX_CHUNKS = 20            # максимум чанков на сессию (20 * 5 сек = 100 сек записи)
+VOICE_SESSION_TTL = int(os.environ.get("VOICE_SESSION_TTL", "600"))          # секунд: сессия без финального чанка сгорает
+VOICE_MAX_CHUNKS = int(os.environ.get("VOICE_MAX_CHUNKS", "20"))            # максимум чанков на сессию (20 * 5 сек = 100 сек записи)
 VOICE_CHUNK_MAX_BYTES = int(os.environ.get("VOICE_CHUNK_MAX_BYTES", str(1 * 1024 * 1024)))
+VOICE_MAX_SESSIONS = int(os.environ.get("VOICE_MAX_SESSIONS", "50"))
+PHOTO_MAX_BYTES = int(os.environ.get("PHOTO_MAX_BYTES", str(2 * 1024 * 1024)))
+VOICE_MAX_BYTES = int(os.environ.get("VOICE_MAX_BYTES", str(2 * 1024 * 1024)))
 
 # HTTP body caps (env-overridable, sane defaults)
 MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", str(8 * 1024 * 1024)))
@@ -181,7 +185,7 @@ def _too_large(e):
 
 def require_device_key():
     key = request.headers.get("X-Device-Key", "")
-    return key == DEVICE_KEY
+    return hmac.compare_digest(key, DEVICE_KEY)
 
 
 def _is_voice_source(source: str) -> bool:
@@ -392,6 +396,9 @@ def handle_photo():
     print(f"[photo] ingress bytes={len(image_bytes)}", flush=True)
     if not image_bytes:
         return jsonify({"error": "empty body, expected raw JPEG bytes"}), 400
+    if len(image_bytes) > PHOTO_MAX_BYTES:
+        print(f"[photo] 413 bytes={len(image_bytes)} cap={PHOTO_MAX_BYTES}", flush=True)
+        return jsonify({"error": "photo too large"}), 413
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -429,6 +436,8 @@ def handle_photos():
 
     images_b64 = payload["images"]
     print(f"[photos] ingress n={len(images_b64)}", flush=True)
+    if not all(isinstance(s, str) for s in images_b64):
+        return jsonify({"error": 'expected JSON body: {"images": ["<base64>", ...]}'}), 400
     if len(images_b64) > PHOTOS_MAX_IMAGES:
         print(f"[photos] 413 n={len(images_b64)} cap={PHOTOS_MAX_IMAGES}", flush=True)
         return jsonify({"error": "too many images"}), 413
@@ -467,6 +476,9 @@ def handle_voice():
     print(f"[voice] ingress bytes={len(audio_bytes)}", flush=True)
     if not audio_bytes:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
+    if len(audio_bytes) > VOICE_MAX_BYTES:
+        print(f"[voice] 413 bytes={len(audio_bytes)} cap={VOICE_MAX_BYTES}", flush=True)
+        return jsonify({"error": "voice too large"}), 413
 
     try:
         answer, _stt_used, _transcript = answer_voice(audio_bytes)
@@ -531,6 +543,9 @@ def handle_voice_chunk():
 
         session = _voice_sessions.get(session_id)
         if session is None:
+            if len(_voice_sessions) >= VOICE_MAX_SESSIONS:
+                print(f"[voice] 413 sessions={len(_voice_sessions)} cap={VOICE_MAX_SESSIONS} sid_tail={sid_tail}", flush=True)
+                return jsonify({"error": "too many sessions"}), 413
             session = {"chunks": {}, "created_at": now}
             _voice_sessions[session_id] = session
 
@@ -753,6 +768,11 @@ if __name__ == "__main__":
         sys.exit("GOOGLE_API_KEY is not set")
     if DEVICE_KEY in ("", "change-me"):
         sys.exit("DEVICE_KEY is not set (placeholder value)")
+
+    print(f"[startup] model={GEMINI_MODEL} groq_stt={GROQ_STT_ENABLED} max_content_length={MAX_CONTENT_LENGTH} "
+          f"photo_max_bytes={PHOTO_MAX_BYTES} voice_max_bytes={VOICE_MAX_BYTES} "
+          f"voice_max_sessions={VOICE_MAX_SESSIONS} voice_max_chunks={VOICE_MAX_CHUNKS} "
+          f"voice_session_ttl={VOICE_SESSION_TTL}", flush=True)
 
     # ВАЖНО: threaded=True обязателен! Обработка финального чанка занимает
     # 10-25 с (Groq STT + Gemini). Без потоков однопоточный dev-сервер
