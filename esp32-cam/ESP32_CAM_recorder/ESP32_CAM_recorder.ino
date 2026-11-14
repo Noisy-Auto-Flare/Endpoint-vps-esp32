@@ -34,6 +34,12 @@
  * GPIO13 выбран как свободный пин на этой плате — не занят камерой, SD-картой
  * (в 1-битном режиме) и вспышкой, в отличие от GPIO0/2/4/12.
  *
+ * ТИХИЙ РЕЖИМ (stealth, v2): белая вспышка GPIO4 НЕ мигает на действиях
+ * (короткое нажатие / коммит / успех / ошибка / пустой staging — всё только
+ * в Serial с HTTP-кодами). Единственный световой сигнал — через 2с после
+ * успешного подключения к Wi-Fi в setup(): LONG 600мс + пауза + SHORT 150мс.
+ * При неуспешном Wi-Fi — никакой индикации, только Serial.
+ *
  * ПЕРЕД ЗАЛИВКОЙ ОБЯЗАТЕЛЬНО ЗАПОЛНИ:
  *   WIFI_SSID / WIFI_PASSWORD  — твоя домашняя сеть
  *   BACKEND_HOST / BACKEND_PORT / BACKEND_DEVICE_KEY — данные твоего бэкенда
@@ -83,8 +89,10 @@
 #define BUTTON_DEBOUNCE_MS 300
 #define BUTTON_LONG_PRESS_MS 1500
 #define FLASH_LED_PIN 4
-// v2: тихий режим — вспышка на захвате только если true
-#define FLASH_ON_CAPTURE false
+// v2: полностью тихий режим (stealth) — никаких миганий на действия кнопки.
+// Единственная индикация: один LONG (600мс) + один SHORT (150мс) спустя 2с
+// после успешного подключения к Wi-Fi в setup(). Все события кнопок —
+// только через Serial (с HTTP-кодами).
 
 // Целевой интервал между кадрами при записи "видео" (кадр-последовательности)
 // SD-карта на 1-битном режиме ESP32-CAM не очень быстрая, поэтому не гонимся
@@ -726,6 +734,12 @@ void setup() {
     Serial.println("");
     Serial.print("Подключено! IP адрес камеры: ");
     Serial.println(WiFi.localIP());
+    // Единственная LED-индикация: спустя 2с после коннекта — LONG + SHORT.
+    // При неуспешном Wi-Fi — никакой индикации, только Serial выше.
+    delay(2000);
+    digitalWrite(FLASH_LED_PIN, HIGH); delay(600); digitalWrite(FLASH_LED_PIN, LOW);
+    delay(300);
+    digitalWrite(FLASH_LED_PIN, HIGH); delay(150); digitalWrite(FLASH_LED_PIN, LOW);
   } else {
     Serial.println("");
     Serial.println("Не удалось подключиться к Wi-Fi. Проверь SSID/пароль.");
@@ -770,53 +784,38 @@ void loop() {
     buttonWasPressed = false;
     unsigned long pressDuration = now - pressTime;
     if (pressDuration >= BUTTON_DEBOUNCE_MS && pressDuration < BUTTON_LONG_PRESS_MS) {
-      // v2: короткое нажатие — снять ОДИН кадр и сразу POST /api/photo-frame
+      // v2: короткое нажатие — снять ОДИН кадр и сразу POST /api/photo-frame.
+      // Тихий режим: без LED, только Serial с HTTP-кодом.
       String frameBody;
       int frameCode = sendFrameToBackend(frameBody);
       if (frameCode == 200) {
-        Serial.println("Кнопка: кадр отправлен в staging");
-        // 1x = кадр принят: яркая вспышка только если разрешена, иначе тихий блип
-        if (FLASH_ON_CAPTURE) {
-          digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW);
-        } else {
-          digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
-        }
+        Serial.println("Кнопка: кадр отправлен в staging (HTTP 200)");
       } else if (frameCode == 413) {
-        Serial.println("staging full — сделай коммит");
-        // 5x = staging full / bytes full / frame too large — нужен коммит
-        for (int i=0; i<5; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
+        Serial.println("Кнопка: staging full — сделай коммит (HTTP 413)");
       } else {
-        Serial.println("Кнопка: ошибка отправки кадра");
-        // 2x = ошибка отправки
-        for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
+        Serial.println("Кнопка: ошибка отправки кадра, HTTP " + String(frameCode));
       }
     }
   }
 
   // Длинное удержание — v2: ВСЕГДА коммит (решение о пустом staging принимает сервер).
   // Успех решаем СТРОГО по HTTP-коду (ответ 200 может содержать слово "error"
-  // в прозе Gemini — это не неудача): 200 = 3x блика, 400 = пустой staging =
-  // 1x короткий блик, 429 = сервер занят (конкурентный коммит) = 4x быстрых,
-  // прочее = 2x блика (ошибка сервера/сети).
+  // в прозе Gemini — это не неудача). Тихий режим: без LED, только Serial.
   if (buttonIsPressed && buttonWasPressed && !longPressHandled && (now - pressTime >= BUTTON_LONG_PRESS_MS)) {
     longPressHandled = true;
     String commitBody;
     int commitCode = sendCommitToBackend(commitBody);
     if (commitCode == 200) {
-      // Успешный коммит: мигнуть 3×
-      for (int i=0; i<3; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(100); digitalWrite(FLASH_LED_PIN, LOW); delay(100); }
+      Serial.println("Кнопка: коммит успешен (HTTP 200)");
     } else if (commitCode == 400) {
-      // Пустой staging (сервер: no staged frames): один короткий блик
+      // Пустой staging (сервер: no staged frames)
       Serial.println("Кнопка: коммит отклонён — staging пуст (HTTP 400)");
-      digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
     } else if (commitCode == 429) {
-      // Сервер занят (конкурентный коммит): 4x быстрых — подожди и повтори позже
+      // Сервер занят (конкурентный коммит) — подожди и повтори позже
       Serial.println("Кнопка: сервер занят (HTTP 429) — подожди и повтори позже");
-      for (int i=0; i<4; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(80); digitalWrite(FLASH_LED_PIN, LOW); delay(80); }
     } else {
-      // Ошибка Gemini/сети: мигнуть 2×
+      // Ошибка Gemini/сети
       Serial.println("Кнопка: ошибка коммита, HTTP " + String(commitCode));
-      for (int i=0; i<2; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
     }
   }
 
