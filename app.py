@@ -599,13 +599,15 @@ def get_latest():
         return jsonify({"error": "unauthorized"}), 401
 
     with _state_lock:
-        name, best = _newest_ready_slot_locked()
-        if best is not None:
+        # Честный ready: после провала коммита старый ответ не отдаём,
+        # пока не придёт свежий (тот же гейт, что в photo-status).
+        _, best = _newest_ready_slot_locked()
+        if best is None or not _honest_answer_ready_locked():
+            result = {"ready": False, "text": "", "source": None, "created_at": 0}
+        else:
             result = {"ready": True, "text": best["text"], "source": best["source"],
                       "created_at": best["created_at"]}
             best["ready"] = False
-        else:
-            result = {"ready": False, "text": "", "source": None, "created_at": 0}
 
     if result.get("ready") and result.get("source") in ("photo", "photos_burst", "photos_commit"):
         global _photo_status

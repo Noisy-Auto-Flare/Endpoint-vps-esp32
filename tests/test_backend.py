@@ -262,6 +262,18 @@ class HonestAnswerReadyTest(unittest.TestCase):
         body = client.get("/api/photo-status", headers=HEADERS).get_json()
         self.assertFalse(body["answer_ready"])
 
+    def test_stale_after_fail_not_served_by_latest(self):
+        mod, client = fresh_app()
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", return_value="canned"):
+            client.post("/api/photos/commit", headers=HEADERS)
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", side_effect=RuntimeError("boom")):
+            resp = client.post("/api/photos/commit", headers=HEADERS)
+        self.assertEqual(resp.status_code, 502)
+        latest = json.loads(client.get("/api/latest", headers=HEADERS).get_data(as_text=True))
+        self.assertFalse(latest["ready"])
+
 
 class VoiceBusyTest(unittest.TestCase):
     def test_voice_busy_false_after_final(self):
