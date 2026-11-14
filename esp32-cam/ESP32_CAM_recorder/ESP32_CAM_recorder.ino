@@ -298,14 +298,17 @@ String sendPhotoToBackend() {
 // ---------------------------------------------------------------------
 // v2: одиночный кадр сразу в staging — POST /api/photo-frame (raw JPEG).
 // Сервер только складывает в staging, в нейронку НЕ отправляет.
-// Возвращает true только при HTTP 200. Без base64/JSON, без локальной копии.
+// Возвращает HTTP status code; тело ответа кладётся в out-param body.
+// 200 = кадр принят, 413 = staging full / bytes full / frame too large
+// (сервер отклонил — нужен коммит), прочее = ошибка отправки.
 // ---------------------------------------------------------------------
-bool sendFrameToBackend() {
+int sendFrameToBackend(String &body) {
   ensureCaptureQuality();
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("sendFrame: не удалось получить кадр с камеры");
-    return false;
+    body = "";
+    return -1;
   }
 
   HTTPClient http;
@@ -322,7 +325,8 @@ bool sendFrameToBackend() {
 
   http.end();
   esp_camera_fb_return(fb);
-  return (httpCode == 200);
+  body = payload;
+  return httpCode;
 }
 
 // ---------------------------------------------------------------------
@@ -767,8 +771,9 @@ void loop() {
     unsigned long pressDuration = now - pressTime;
     if (pressDuration >= BUTTON_DEBOUNCE_MS && pressDuration < BUTTON_LONG_PRESS_MS) {
       // v2: короткое нажатие — снять ОДИН кадр и сразу POST /api/photo-frame
-      bool ok = sendFrameToBackend();
-      if (ok) {
+      String frameBody;
+      int frameCode = sendFrameToBackend(frameBody);
+      if (frameCode == 200) {
         Serial.println("Кнопка: кадр отправлен в staging");
         // 1x = кадр принят: яркая вспышка только если разрешена, иначе тихий блип
         if (FLASH_ON_CAPTURE) {
@@ -776,6 +781,10 @@ void loop() {
         } else {
           digitalWrite(FLASH_LED_PIN, HIGH); delay(30); digitalWrite(FLASH_LED_PIN, LOW);
         }
+      } else if (frameCode == 413) {
+        Serial.println("staging full — сделай коммит");
+        // 5x = staging full / bytes full / frame too large — нужен коммит
+        for (int i=0; i<5; i++) { digitalWrite(FLASH_LED_PIN, HIGH); delay(200); digitalWrite(FLASH_LED_PIN, LOW); delay(200); }
       } else {
         Serial.println("Кнопка: ошибка отправки кадра");
         // 2x = ошибка отправки

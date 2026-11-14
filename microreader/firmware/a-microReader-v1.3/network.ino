@@ -102,6 +102,9 @@ bool fetchAndSaveAnswer() {
     return success;
 }
 
+// LEGACY: single-shot опрос /api/latest без меню. Заменено на
+// enterAnswersMenu()/enterMonitorMenu() в answers.ino (v1.3: Меню 2/3).
+// Оставлено как fallback, не вызывать из нового меню. Поведение не менять.
 void enterToGetAnswerMode() {
     // 1. Валидация конфига
     if (strlen(sets.backendHost) == 0 || sets.backendPort == 0 || strlen(sets.deviceKey) == 0) {
@@ -224,6 +227,9 @@ void drawPhotoStatus(int staged, const String& ruStatus) {
     oled.update();
 }
 
+// LEGACY: старое окно статуса фото (OK=обновить, UP=забрать). Заменено на
+// enterMonitorMenu() в answers.ino (v1.3: Меню 3, опрос /api/photo-status раз в 1 с).
+// Оставлено как fallback, не вызывать из нового меню. Поведение не менять.
 // Меню статуса фото: staged + photo_status с GET /api/photo-status.
 // OK — обновить, UP — забрать ответ (если answer_ready),
 // удержание ВНИЗ или 30 с бездействия — выход.
