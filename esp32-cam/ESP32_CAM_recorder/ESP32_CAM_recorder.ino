@@ -71,7 +71,7 @@
 // FRAMESIZE_ варианты: FRAMESIZE_QVGA(320x240), FRAMESIZE_VGA(640x480),
 // FRAMESIZE_SVGA(800x600), FRAMESIZE_XGA, FRAMESIZE_UXGA(1600x1200) и т.д.
 #define CAPTURE_FRAMESIZE   FRAMESIZE_SVGA
-#define CAPTURE_JPEG_QUALITY 10   // 0(лучшее)..63(худшее), 10-12 — хороший баланс
+#define CAPTURE_JPEG_QUALITY 12   // 0(лучшее)..63(худшее); 12 вместо 10: на ~20-30% меньше байт кадра, для печатных заданий качества хватает
 
 // Разрешение/качество ТОЛЬКО для быстрого живого превью в браузере (/stream)
 // Специально маленькое и похуже качеством — чтобы обновлялось быстро

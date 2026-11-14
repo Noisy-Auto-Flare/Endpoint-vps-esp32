@@ -8,7 +8,9 @@ bool fetchAndSaveAnswer() {
 
     WiFiClient client;
     HTTPClient http;
-    String url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/latest";
+    String url;
+    url.reserve(96);  // пресайз: меньше переаллокаций кучи на ESP8266
+    url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/latest";
 
     http.begin(client, url);
     http.addHeader("X-Device-Key", sets.deviceKey);
@@ -167,7 +169,9 @@ String photoStatusRu(const String& s) {
 bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy) {
     WiFiClient client;
     HTTPClient http;
-    String url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/photo-status";
+    String url;
+    url.reserve(96);  // пресайз: меньше переаллокаций кучи на ESP8266
+    url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/photo-status";
 
     http.begin(client, url);
     http.addHeader("X-Device-Key", sets.deviceKey);

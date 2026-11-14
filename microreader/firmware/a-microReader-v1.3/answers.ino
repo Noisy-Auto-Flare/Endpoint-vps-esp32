@@ -168,6 +168,7 @@ void enterMonitorMenu() {
         } else {
           monReady = false;
           monLineCount = 1;
+          monLines[0].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
           monLines[0] = "кадров на сервере: " + String(staged);
           if (voiceBusy && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
         }
@@ -207,6 +208,7 @@ void enterMonitorMenu() {
               if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
                 monReady = answerReady;
                 monLineCount = 0;
+                monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
                 monLines[monLineCount++] = "кадров на сервере: " + String(staged);
                 if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
                 else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
@@ -233,13 +235,15 @@ void enterMonitorMenu() {
       // OK на строках статуса (ответ не готов): ничего не делаем
     }
 
-    // Опрос раз в секунду, только пока ВКЛ
-    if (monitoring && millis() - lastPoll >= 1000) {
+    // Опрос раз в 2 с, только пока ВКЛ (трафик мизерный — реже дёргаем сеть,
+    // вдвое меньше String-чёрна и мусора в Serial, UX тот же — ответ забирается вручную по OK)
+    if (monitoring && millis() - lastPoll >= 2000) {
       lastPoll = millis();
       bool answerReady = false;
       if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
         monReady = answerReady;
         monLineCount = 0;
+        monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
         monLines[monLineCount++] = "кадров на сервере: " + String(staged);
         if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
         else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
