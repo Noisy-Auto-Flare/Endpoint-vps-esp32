@@ -22,7 +22,12 @@ void ansRebuildList() {
     if (nm.startsWith("/answer_") && nm.endsWith(".txt")) {
       int num = nm.substring(8, nm.length() - 4).toInt();
       if (num <= 0) continue;
-      if (ansCount >= ANS_MAX) continue;
+      if (ansCount >= ANS_MAX) {
+        // Массив полон: держим 40 НОВЕЙШИХ — вытесняем самый старый,
+        // только если пришедший новее. Иначе файл пропускаем.
+        if (num <= ansNums[ansCount - 1]) continue;
+        ansCount--;
+      }
       int pos = ansCount;
       while (pos > 0 && ansNums[pos - 1] < num) {
         ansNums[pos] = ansNums[pos - 1];

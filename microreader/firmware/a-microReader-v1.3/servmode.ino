@@ -89,7 +89,7 @@ void drawFormatNotify(void) {
 void drawServiceMenu(void) {
   oled.clear();               // Чистим дисплей
   oled.line(0, 10, 127, 10);  // Линия
-  oled.print(F("FW.V1.2"));   // Версия прошивки
+  oled.print(F("FW.V1.3"));   // Версия прошивки
   oled.setCursor(0, 2);       // Выводим с 2й строки
 
   oled.print(F(               // Выводим пункты

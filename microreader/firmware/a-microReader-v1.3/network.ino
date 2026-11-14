@@ -53,8 +53,17 @@ bool fetchAndSaveAnswer() {
                     String fn = "/answer_" + String(answerNum) + ".txt";
                     File f = LittleFS.open(fn, "w");
                     if (f) {
-                        f.print(answerText);
+                        size_t written = f.print(answerText);
                         f.close();
+                        if (written != answerText.length()) {
+                            // Диск переполнен посреди записи: показываем ошибку,
+                            // частичный файл остаётся (не блокирует свой N).
+                            oled.clear(); oled.home();
+                            oled.println("Ошибка записи:");
+                            oled.println("нет места");
+                            oled.println("на диске");
+                            oled.update(); delay(2000);
+                        } else {
                         oled.clear(); oled.home();
                         oled.println("Ответ получен!");
                         oled.println("");
@@ -64,6 +73,14 @@ bool fetchAndSaveAnswer() {
                         oled.update();
                         success = true;
                         delay(3000);
+                        }
+                    } else {
+                        // Файл не открылся (диск полон): молча не уходим.
+                        oled.clear(); oled.home();
+                        oled.println("Ошибка записи:");
+                        oled.println("нет места");
+                        oled.println("на диске");
+                        oled.update(); delay(2000);
                     }
                 }
             }
