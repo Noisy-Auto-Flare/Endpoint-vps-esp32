@@ -6,10 +6,12 @@
      -> сервер отправляет его в Gemini (vision) через Google AI Studio
      -> текстовый ответ сохраняется как "последний результат"
 
-  2) microReader (с микрофоном) шлёт WAV на POST /api/voice
-     -> сервер отправляет аудио НАПРЯМУЮ в Gemini (модель понимает звук без
-        отдельного шага транскрипции) с промптом "ответь на то, что услышал"
-     -> текстовый ответ сохраняется как "последний результат"
+   2) ESP32-C3 шлёт WAV-чанки на POST /api/voice-chunk (или WAV на POST /api/voice)
+      -> сервер склеивает чанки в один WAV
+      -> если GROQ_STT_ENABLED=true: Groq Whisper (расшифровка в текст) -> текст в Gemini;
+         иначе (по умолчанию) аудио НАПРЯМУЮ в Gemini (модель понимает звук без
+         отдельного шага транскрипции) с промптом "ответь на то, что услышал"
+      -> текстовый ответ сохраняется как "последний результат"
 
   3) microReader опрашивает GET /api/latest
      -> получает {"ready": true/false, "text": "..."}
@@ -38,24 +40,26 @@ import requests
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 DEVICE_KEY = os.environ.get("DEVICE_KEY", "change-me")
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
-# --- STT (распознавание речи) через Groq Whisper ---
-# Основной путь: чанки -> склейка -> Groq Whisper (расшифровка в текст) -> Gemini (ответ).
-# Резервный путь: если GROQ_API_KEY не задан или Groq упал — аудио сразу в Gemini.
-STT_PROVIDER = os.environ.get("STT_PROVIDER", "groq")            # groq | gemini
+# --- STT (распознавание речи) через Groq Whisper, вкл/выкл тумблером ---
+# Выкл (по умолчанию): аудио напрямую в отвечающую модель Gemini.
+# Вкл: чанки -> склейка -> Groq Whisper (расшифровка в текст) -> Gemini (ответ).
+# Резервный путь: если GROQ_STT_ENABLED=true, но GROQ_API_KEY не задан или Groq
+# упал/вернул пусто — аудио сразу в Gemini.
+GROQ_STT_ENABLED = os.environ.get("GROQ_STT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
 GROQ_STT_LANGUAGE = os.environ.get("GROQ_STT_LANGUAGE", "ru")
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
 
-# Системный промпт для голосовых запросов (можно менять под задачу)
-VOICE_SYSTEM_PROMPT = os.environ.get(
-    "VOICE_SYSTEM_PROMPT",
+# Системный промпт для голосовых запросов напрямую по аудио (можно менять под задачу)
+VOICE_AUDIO_PROMPT = os.environ.get(
+    "VOICE_AUDIO_PROMPT",
     "Ты — голосовой ассистент школьника на маленьком устройстве. "
-    "Тебе присылают аудио с голосовым вопросом или заданием пользователя. "
+    "Тебе присылают аудио с голосовым вопросом или заданием пользователя — слушай аудио внимательно. "
     "Отвечай ПОДРОБНО, строго в трёх частях по порядку: "
     "1) СНАЧАЛА опиши, как ты понял задание: перескажи, что именно услышал в аудио и что требуется сделать. "
     "2) ЗАТЕМ очень подробно объясни ход решения: почему ответ такой, а не другой, "
@@ -64,6 +68,21 @@ VOICE_SYSTEM_PROMPT = os.environ.get(
     "Никакой markdown-разметки и специальных символов (звёздочки, решётки, доллары запрещены) — "
     "только обычный текст, который удобно читать вслух или на маленьком экране. "
     "Если в аудио не задание, а просто вопрос — отвечай подробно и по существу."
+)
+
+# Системный промпт для голосовых запросов по готовой расшифровке (путь через Groq STT)
+VOICE_TRANSCRIPT_PROMPT = os.environ.get(
+    "VOICE_TRANSCRIPT_PROMPT",
+    "Ты — голосовой ассистент школьника на маленьком устройстве. "
+    "Тебе присылают расшифровку голосового вопроса или задания пользователя текстом. "
+    "Отвечай ПОДРОБНО, строго в трёх частях по порядку: "
+    "1) СНАЧАЛА опиши, как ты понял задание: перескажи, что именно сказано в расшифровке и что требуется сделать. "
+    "2) ЗАТЕМ очень подробно объясни ход решения: почему ответ такой, а не другой, "
+    "обоснуй каждый шаг простыми словами, как учитель для ученика. "
+    "3) В КОНЦЕ чётко назови итоговый ответ. "
+    "Никакой markdown-разметки и специальных символов (звёздочки, решётки, доллары запрещены) — "
+    "только обычный текст, который удобно читать вслух или на маленьком экране. "
+    "Если в расшифровке не задание, а просто вопрос — отвечай подробно и по существу."
 )
 
 # Системный промпт для фото-запросов
@@ -93,9 +112,17 @@ _state = {
     "created_at": 0,
 }
 
-# Накопление голосовых чанков от ESP32-C3: session_id -> {"chunks": [bytes], "created_at": float}
+# Накопление голосовых чанков от ESP32-C3: session_id -> {"chunks": {index: bytes}, "created_at": float}
+# Чанки хранятся по X-Chunk-Index, на финале сортируются по индексу.
 _voice_sessions_lock = threading.Lock()
 _voice_sessions = {}
+
+# Стейджинг фото-кадров v2 (один глобальный, как _state — одна связка устройств).
+# Короткие нажатия складывают кадры сюда, удержание коммитит всё в Gemini разом.
+PHOTO_STAGING_CAP = 20
+_photo_lock = threading.Lock()
+_photo_staging: list = []       # сырые JPEG-байты кадров
+_photo_status = "idle"          # idle | staged | sent_to_llm | txt_ready | consumed | error
 
 
 def require_device_key():
@@ -217,6 +244,58 @@ def transcribe_groq(wav_bytes: bytes) -> str:
     return (resp.json().get("text") or "").strip()
 
 
+def answer_voice(wav_bytes: bytes):
+    """
+    Единая STT-развилка для голоса: Groq Whisper -> текст -> Gemini,
+    иначе склеенное/сырое аудио напрямую в Gemini.
+
+    Используется и /api/voice, и финалом /api/voice-chunk, чтобы тумблер
+    GROQ_STT_ENABLED действовал одинаково на обоих путях (аудит M3).
+    Возвращает (answer, stt_used, transcript); ошибки Gemini пробрасывает выше.
+    """
+    stt_used = False
+    transcript = ""
+    if GROQ_STT_ENABLED and GROQ_API_KEY:
+        try:
+            transcript = transcribe_groq(wav_bytes)
+            if transcript:
+                stt_used = True
+                print(f"[stt] groq ok, model={GROQ_STT_MODEL} len={len(transcript)} "
+                      f"preview={transcript[:100]!r}", flush=True)
+            else:
+                print("[stt] groq вернул пустой текст; fallback на Gemini audio", flush=True)
+        except (requests.RequestException, ValueError) as e:
+            print(f"[stt] groq упал err_class={type(e).__name__}; fallback на Gemini audio", flush=True)
+    elif GROQ_STT_ENABLED:
+        print("[stt] GROQ_STT_ENABLED=true, но GROQ_API_KEY не задан; fallback на Gemini audio", flush=True)
+    if not stt_used:
+        print(f"[stt] gemini_direct transcript_len=0 bytes={len(wav_bytes)}", flush=True)
+
+    stt_tag = "groq" if stt_used else "gemini_direct"
+    t0 = time.monotonic()
+    try:
+        if stt_used:
+            answer = call_gemini(
+                VOICE_TRANSCRIPT_PROMPT,
+                [{"text": f"Голосовое сообщение пользователя (расшифровка речи):\n{transcript}"}],
+            )
+        else:
+            audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+            answer = call_gemini(
+                VOICE_AUDIO_PROMPT,
+                [
+                    {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                ],
+            )
+    except (requests.RequestException, RuntimeError) as e:
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[gemini] voice fail err_class={type(e).__name__} ms={dt_ms} status=502 stt={stt_tag}", flush=True)
+        raise
+    dt_ms = int((time.monotonic() - t0) * 1000)
+    print(f"[gemini] voice ok ms={dt_ms} stt={stt_tag} bytes={len(wav_bytes)}", flush=True)
+    return answer, stt_used, transcript
+
+
 # ---------------------------------------------------------------------
 # POST /api/photo — принимает JPEG (сырые байты в теле запроса)
 # ---------------------------------------------------------------------
@@ -226,6 +305,7 @@ def handle_photo():
         return jsonify({"error": "unauthorized"}), 401
 
     image_bytes = request.get_data()
+    print(f"[photo] ingress bytes={len(image_bytes)}", flush=True)
     if not image_bytes:
         return jsonify({"error": "empty body, expected raw JPEG bytes"}), 400
 
@@ -240,7 +320,8 @@ def handle_photo():
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
-        return jsonify({"error": f"gemini request failed: {e}"}), 502
+        print(f"[gemini] photo fail err_class={type(e).__name__} status=502", flush=True)
+        return jsonify({"error": "gemini request failed"}), 502
 
     set_latest_result(answer, source="photo")
     return jsonify({"ok": True, "text": answer})
@@ -259,6 +340,7 @@ def handle_photos():
         return jsonify({"error": 'expected JSON body: {"images": ["<base64>", ...]}'}), 400
 
     images_b64 = payload["images"]
+    print(f"[photos] ingress n={len(images_b64)}", flush=True)
 
     parts = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
     for img_b64 in images_b64:
@@ -267,7 +349,8 @@ def handle_photos():
     try:
         answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
     except (requests.RequestException, RuntimeError) as e:
-        return jsonify({"error": f"gemini request failed: {e}"}), 502
+        print(f"[gemini] photos fail err_class={type(e).__name__} status=502", flush=True)
+        return jsonify({"error": "gemini request failed"}), 502
 
     set_latest_result(answer, source="photos_burst")
     return jsonify({"ok": True, "text": answer})
@@ -282,20 +365,14 @@ def handle_voice():
         return jsonify({"error": "unauthorized"}), 401
 
     audio_bytes = request.get_data()
+    print(f"[voice] ingress bytes={len(audio_bytes)}", flush=True)
     if not audio_bytes:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
-    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-
     try:
-        answer = call_gemini(
-            VOICE_SYSTEM_PROMPT,
-            [
-                {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
-            ],
-        )
-    except (requests.RequestException, RuntimeError) as e:
-        return jsonify({"error": f"gemini request failed: {e}"}), 502
+        answer, _stt_used, _transcript = answer_voice(audio_bytes)
+    except (requests.RequestException, RuntimeError):
+        return jsonify({"error": "gemini request failed"}), 502
 
     set_latest_result(answer, source="voice")
     return jsonify({"ok": True, "text": answer})
@@ -338,74 +415,72 @@ def handle_voice_chunk():
     elif not audio_bytes or len(audio_bytes) <= 44:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
+    sid_tail = session_id[-6:] if len(session_id) > 6 else session_id
+    print(f"[voice] chunk sid_tail={sid_tail} idx={chunk_index} bytes={len(audio_bytes)} final={is_final}", flush=True)
+
     # Очистка просроченных сессий (чтобы память не текла)
     now = time.time()
     with _voice_sessions_lock:
         expired = [sid for sid, s in _voice_sessions.items() if now - s["created_at"] > VOICE_SESSION_TTL]
         for sid in expired:
             del _voice_sessions[sid]
+        if expired:
+            print(f"[voice] evict n={len(expired)} ttl={VOICE_SESSION_TTL}", flush=True)
 
         session = _voice_sessions.get(session_id)
         if session is None:
-            session = {"chunks": [], "created_at": now}
+            session = {"chunks": {}, "created_at": now}
             _voice_sessions[session_id] = session
 
-        # Защита от разрастания: сбрасываем сессию, если пришло слишком много чанков
-        if len(session["chunks"]) >= VOICE_MAX_CHUNKS:
+        # Защита от разрастания: сбрасываем сессию, если пришло слишком много чанков.
+        # Повтор уже известного индекса — перезапись, а не рост (см. warn ниже).
+        if chunk_index not in session["chunks"] and len(session["chunks"]) >= VOICE_MAX_CHUNKS:
+            n = len(session["chunks"])
             del _voice_sessions[session_id]
+            print(f"[voice] 413 sid_tail={sid_tail} chunks={n} cap={VOICE_MAX_CHUNKS}", flush=True)
             return jsonify({"error": "too many chunks, session reset"}), 413
 
-        session["chunks"].append(audio_bytes)
+        if audio_bytes:
+            if chunk_index in session["chunks"]:
+                print(f"[voice] warn sid_tail={sid_tail} duplicate idx={chunk_index} overwrite", flush=True)
+            session["chunks"][chunk_index] = audio_bytes
 
         if not is_final:
             return jsonify({"ok": True, "chunks_received": len(session["chunks"])})
 
-        # Финальный чанк: забираем накопленное и очищаем сессию
-        chunks = list(session["chunks"])
+        # Финальный чанк: забираем накопленное в порядке индексов и очищаем сессию
+        ordered_keys = sorted(session["chunks"].keys())
+        chunks = [session["chunks"][i] for i in ordered_keys]
+        if ordered_keys:
+            expected = list(range(ordered_keys[-1] + 1))
+            missing = [i for i in expected if i not in session["chunks"]]
+        else:
+            expected = []
+            missing = []
         del _voice_sessions[session_id]
 
+    if missing:
+        print(f"[voice] merge fail reason=missing chunks sid_tail={sid_tail} expected={expected} got={ordered_keys}", flush=True)
+        return jsonify({"error": f"missing chunks: expected {expected} got {ordered_keys}"}), 400
+
+    t_merge = time.monotonic()
     try:
         merged_audio = merge_wav_chunks(chunks)
     except RuntimeError as e:
+        print(f"[voice] merge fail reason={e} sid_tail={sid_tail} n={len(chunks)}", flush=True)
         return jsonify({"error": f"failed to merge chunks: {e}"}), 400
+    merge_ms = int((time.monotonic() - t_merge) * 1000)
+    print(f"[voice] merge n={len(chunks)} bytes={len(merged_audio)} ms={merge_ms} sid_tail={sid_tail}", flush=True)
 
-    # --- Основной путь: Groq Whisper (расшифровка) -> текст -> Gemini ---
-    stt_used = False
-    transcript = ""
-    if STT_PROVIDER == "groq" and GROQ_API_KEY:
-        try:
-            transcript = transcribe_groq(merged_audio)
-            if transcript:
-                stt_used = True
-                print(f"[stt] groq ok, model={GROQ_STT_MODEL} len={len(transcript)} "
-                      f"preview={transcript[:100]!r}", flush=True)
-            else:
-                print("[stt] groq вернул пустой текст; fallback на Gemini audio", flush=True)
-        except (requests.RequestException, ValueError) as e:
-            print(f"[stt] groq упал ({e}); fallback на Gemini audio", flush=True)
-
+    # Единая STT-развилка (тот же helper, что у /api/voice): Groq STT либо аудио в Gemini.
     try:
-        if stt_used:
-            # В нейронку уходит готовая расшифровка текстом
-            answer = call_gemini(
-                VOICE_SYSTEM_PROMPT,
-                [{"text": f"Голосовое сообщение пользователя (расшифровка речи):\n{transcript}"}],
-            )
-        else:
-            # Резервный путь: склеенное аудио напрямую в Gemini
-            audio_b64 = base64.b64encode(merged_audio).decode("utf-8")
-            answer = call_gemini(
-                VOICE_SYSTEM_PROMPT,
-                [
-                    {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
-                ],
-            )
-    except (requests.RequestException, RuntimeError) as e:
-        return jsonify({"error": f"gemini request failed: {e}"}), 502
+        answer, stt_used, transcript = answer_voice(merged_audio)
+    except (requests.RequestException, RuntimeError):
+        return jsonify({"error": "gemini request failed"}), 502
 
     set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
     return jsonify({"ok": True, "final": True,
-                    "stt": "groq" if stt_used else "gemini_audio",
+                    "stt": "groq" if stt_used else "gemini_direct",
                     "transcript": transcript,
                     "text": answer})
 
@@ -425,10 +500,119 @@ def get_latest():
         if _state["ready"]:
             _state["ready"] = False
 
+    # Отдали фото-ответ — переводим фото-статус в consumed (голосовой флоу не трогаем).
+    if result.get("ready") and result.get("source") in ("photo", "photos_burst", "photos_commit"):
+        global _photo_status
+        with _photo_lock:
+            _photo_status = "consumed"
+        print(f"[photo] latest отдан, source={result.get('source')} status=consumed", flush=True)
+
     # Используем json.dumps с ensure_ascii=False для сохранения русского текста.
     # ВАЖНО: separators=(",", ":") даёт компактный JSON БЕЗ пробелов ({"ready":true,...}),
     # т.к. прошивка microReader парсит ответ вручную через indexOf и ждёт точный формат.
     response_text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    return Response(response_text, mimetype='application/json')
+
+
+# ---------------------------------------------------------------------
+# POST /api/photo-frame — принять 1 JPEG в staging (без отправки в Gemini)
+# ---------------------------------------------------------------------
+@app.route("/api/photo-frame", methods=["POST"])
+def handle_photo_frame():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    image_bytes = request.get_data()
+    if not image_bytes:
+        return jsonify({"error": "empty body, expected raw JPEG bytes"}), 400
+
+    global _photo_status
+    with _photo_lock:
+        if len(_photo_staging) >= PHOTO_STAGING_CAP:
+            print(f"[photo] staging full bytes={len(image_bytes)} staged={len(_photo_staging)} cap={PHOTO_STAGING_CAP}", flush=True)
+            return jsonify({"error": "staging full"}), 413
+        _photo_staging.append(image_bytes)
+        staged = len(_photo_staging)
+        _photo_status = "staged"
+
+    print(f"[photo] frame ingress bytes={len(image_bytes)} staged={staged}", flush=True)
+    return jsonify({"ok": True, "staged": staged})
+
+
+# ---------------------------------------------------------------------
+# POST /api/photos/commit — отправить все staged-кадры в Gemini разом
+# ---------------------------------------------------------------------
+@app.route("/api/photos/commit", methods=["POST"])
+def handle_photos_commit():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    global _photo_status
+    with _photo_lock:
+        if not _photo_staging:
+            return jsonify({"error": "no staged frames"}), 400
+        frames = list(_photo_staging)
+        committed = len(frames)
+        _photo_status = "sent_to_llm"
+
+    print(f"[photo] commit, frames={len(frames)} status=sent_to_llm", flush=True)
+
+    parts: list = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
+    for frame in frames:
+        parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                      "data": base64.b64encode(frame).decode("utf-8")}})
+
+    t0 = time.monotonic()
+    try:
+        answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
+    except (requests.RequestException, RuntimeError) as e:
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        # Стейджинг НЕ чистим — кадры остаются для повторного коммита
+        with _photo_lock:
+            _photo_status = "error"
+        with _state_lock:
+            stale = bool(_state["ready"])
+            stale_source = _state.get("source")
+        if stale:
+            print(f"[photo] warn commit failed, stale answer kept source={stale_source}", flush=True)
+        print(f"[gemini] commit fail err_class={type(e).__name__} ms={dt_ms} status=502", flush=True)
+        return jsonify({"error": "gemini request failed"}), 502
+    dt_ms = int((time.monotonic() - t0) * 1000)
+    print(f"[gemini] commit ok ms={dt_ms} frames={len(frames)}", flush=True)
+
+    total_bytes = sum(len(f) for f in frames)
+    set_latest_result(answer, source="photos_commit")
+    with _photo_lock:
+        # Prefix-pop: убираем ровно закоммиченный префикс; кадры, пришедшие
+        # во время вызова Gemini, остаются в стейджинге для следующего коммита.
+        del _photo_staging[:committed]
+        _photo_status = "txt_ready"
+
+    print(f"[photo] commit ok, frames={len(frames)} bytes={total_bytes} ms={dt_ms} status=txt_ready", flush=True)
+    return jsonify({"ok": True, "frames": len(frames), "text": answer})
+
+
+# ---------------------------------------------------------------------
+# GET /api/photo-status — лёгкий опрос стейджинга для microReader
+# ---------------------------------------------------------------------
+@app.route("/api/photo-status", methods=["GET"])
+def get_photo_status():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    with _photo_lock:
+        staged = len(_photo_staging)
+        status = _photo_status
+    with _state_lock:
+        # answer_ready для ЛЮБОГО готового ответа (фото и голос): меню UP
+        # забирает через GET /api/latest, который отдаёт любой source.
+        answer_ready = bool(_state["ready"])
+
+    # Компактный JSON БЕЗ пробелов (separators=(",",":")): прошивка microReader
+    # парсит ответ вручную через indexOf и ждёт точный формат без пробелов
+    # ("staged":N, "photo_status":"...", "answer_ready":true) — как /api/latest.
+    response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready},
+                               ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
 
