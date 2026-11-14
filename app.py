@@ -683,11 +683,14 @@ def get_latest():
     if result.get("ready") and _is_voice_source(result.get("source") or ""):
         with _photo_lock:
             _staging_empty = not _photo_staging
+            _status_now = _photo_status
         with _state_lock:
             _photo_ready = _photo_answer["ready"]
-        if _staging_empty and not _photo_ready:
+        # Сбрасываем только спокойные состояния: error (провал коммита) и
+        # sent_to_llm (коммит в полёте) должны остаться видны.
+        if _staging_empty and not _photo_ready and _status_now in ("consumed", "txt_ready", "idle", "staged"):
             with _photo_lock:
-                if not _photo_staging:
+                if not _photo_staging and _photo_status == _status_now:
                     _photo_status = "idle"
             print("[photo] latest отдан voice, staging пуст и фото-слот не ready: status=idle", flush=True)
 
