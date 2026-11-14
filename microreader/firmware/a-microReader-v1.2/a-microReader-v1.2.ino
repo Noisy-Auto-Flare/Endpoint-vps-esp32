@@ -103,6 +103,7 @@ uint8_t HEIGHT = (128/SEGMENT);                     // и высота
 /* =========================================== */
 
 void enterToGetAnswerMode();
+void enterPhotoStatusMenu();
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);         // Лед на модуле как выход
@@ -225,7 +226,7 @@ void loop() {
 
   if (down.hold()) {
     uiTimer = millis();
-    enterToGetAnswerMode();
+    enterPhotoStatusMenu();
   }
 
   if (millis() - uiTimer >= 5000) {  // Каждые 5 сек принудительно обновляем дисп. ради индикации заряда
