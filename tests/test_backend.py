@@ -131,7 +131,7 @@ class PhotoStatusTest(unittest.TestCase):
     def test_idle_shape(self):
         _, client = fresh_app()
         body = client.get("/api/photo-status", headers=HEADERS).get_json()
-        self.assertEqual(body, {"staged": 0, "photo_status": "idle", "answer_ready": False})
+        self.assertEqual(body, {"staged": 0, "photo_status": "idle", "answer_ready": False, "voice_busy": False})
 
     def test_staged_shape(self):
         _, client = fresh_app()
@@ -222,6 +222,70 @@ class LegacyPhotosTest(unittest.TestCase):
         _, client = fresh_app()
         resp = client.post("/api/photos", headers=HEADERS, json={"images": []})
         self.assertEqual(resp.status_code, 400)
+
+
+class TwoSlotTest(unittest.TestCase):
+    def test_photo_then_voice_newest_first(self):
+        mod, client = fresh_app()
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", return_value="photo-answer"):
+            client.post("/api/photos/commit", headers=HEADERS)
+        vheaders = dict(HEADERS, **{
+            "X-Session-Id": "twoslot",
+            "X-Chunk-Index": "0",
+            "X-Final": "true",
+            "Content-Type": "audio/wav",
+        })
+        with mock.patch.object(mod, "call_gemini", return_value="voice-answer"):
+            resp = client.post("/api/voice-chunk", headers=vheaders, data=_wav())
+        self.assertEqual(resp.status_code, 200)
+        first = json.loads(client.get("/api/latest", headers=HEADERS).get_data(as_text=True))
+        self.assertTrue(first["ready"])
+        self.assertEqual(first["text"], "voice-answer")
+        second = json.loads(client.get("/api/latest", headers=HEADERS).get_data(as_text=True))
+        self.assertTrue(second["ready"])
+        self.assertEqual(second["text"], "photo-answer")
+        third = json.loads(client.get("/api/latest", headers=HEADERS).get_data(as_text=True))
+        self.assertFalse(third["ready"])
+
+
+class HonestAnswerReadyTest(unittest.TestCase):
+    def test_stale_after_fail_not_ready(self):
+        mod, client = fresh_app()
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", return_value="canned"):
+            client.post("/api/photos/commit", headers=HEADERS)
+        client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+        with mock.patch.object(mod, "call_gemini", side_effect=RuntimeError("boom")):
+            resp = client.post("/api/photos/commit", headers=HEADERS)
+        self.assertEqual(resp.status_code, 502)
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertFalse(body["answer_ready"])
+
+
+class VoiceBusyTest(unittest.TestCase):
+    def test_voice_busy_false_after_final(self):
+        mod, client = fresh_app()
+        vheaders = dict(HEADERS, **{
+            "X-Session-Id": "busy1",
+            "X-Chunk-Index": "0",
+            "X-Final": "true",
+            "Content-Type": "audio/wav",
+        })
+        with mock.patch.object(mod, "call_gemini", return_value="v"):
+            client.post("/api/voice-chunk", headers=vheaders, data=_wav())
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertIn("voice_busy", body)
+        self.assertFalse(body["voice_busy"])
+
+
+class OversizeFrameTest(unittest.TestCase):
+    def test_oversize_frame_413(self):
+        mod, client = fresh_app()
+        setattr(mod, "PHOTO_FRAME_MAX_BYTES", 10)
+        resp = client.post("/api/photo-frame", headers=HEADERS, data=b"x" * 100)
+        self.assertEqual(resp.status_code, 413)
+        self.assertIn("error", resp.get_json())
 
 
 if __name__ == "__main__":

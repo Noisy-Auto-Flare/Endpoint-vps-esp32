@@ -28,8 +28,15 @@ import argparse
 import base64
 import os
 import struct
+import sys
 import threading
 import time
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import json
 from flask import Flask, request, Response, jsonify
@@ -96,34 +103,80 @@ PHOTO_SYSTEM_PROMPT = os.environ.get(
 # склейка в один WAV и отправка в Gemini при приходе финального чанка.
 VOICE_SESSION_TTL = 600          # секунд: сессия без финального чанка сгорает
 VOICE_MAX_CHUNKS = 20            # максимум чанков на сессию (20 * 5 сек = 100 сек записи)
+VOICE_CHUNK_MAX_BYTES = int(os.environ.get("VOICE_CHUNK_MAX_BYTES", str(1 * 1024 * 1024)))
+
+# HTTP body caps (env-overridable, sane defaults)
+MAX_CONTENT_LENGTH = int(os.environ.get("MAX_CONTENT_LENGTH", str(8 * 1024 * 1024)))
+PHOTO_FRAME_MAX_BYTES = int(os.environ.get("PHOTO_FRAME_MAX_BYTES", str(2 * 1024 * 1024)))
+PHOTOS_MAX_IMAGES = int(os.environ.get("PHOTOS_MAX_IMAGES", "10"))
+PHOTOS_MAX_TOTAL_B64 = int(os.environ.get("PHOTOS_MAX_TOTAL_B64", str(6 * 1024 * 1024)))
 
 # =====================================================================
 
 app = Flask(__name__)
 app.json.ensure_ascii = False   # отключает экранирование Unicode — иначе русский текст придёт как \uXXXX
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-# Простое общее хранилище "последнего результата" (для одного устройства/связки).
-# Защищено локом, потому что параллельные запросы теоретически возможны.
+# Два слота ответов (фото + голос): каждый {ready,text,source,created_at,seq}.
+# /api/latest отдаёт newest ready и потребляет только его.
 _state_lock = threading.Lock()
-_state = {
-    "ready": False,
-    "text": "",
-    "source": None,      # "photo" или "voice"
-    "created_at": 0,
-}
+_answer_seq = 0
+_photo_answer = {"ready": False, "text": "", "source": None, "created_at": 0, "seq": 0}
+_voice_answer = {"ready": False, "text": "", "source": None, "created_at": 0, "seq": 0}
+
+# Честный answer_ready: true только если слот стал ready после последнего failed commit.
+_last_commit_failed = False
+_last_commit_failed_at = 0.0
+
+# voice_busy: true пока обрабатывается голосовой финал.
+_voice_busy_lock = threading.Lock()
+_voice_busy = False
 
 # Накопление голосовых чанков от ESP32-C3: session_id -> {"chunks": {index: bytes}, "created_at": float}
 # Чанки хранятся по X-Chunk-Index, на финале сортируются по индексу.
 _voice_sessions_lock = threading.Lock()
 _voice_sessions = {}
 
-# Стейджинг фото-кадров v2 (один глобальный, как _state — одна связка устройств).
+# Стейджинг фото-кадров v2 (один глобальный, как слоты ответов — одна связка устройств).
 # Короткие нажатия складывают кадры сюда, удержание коммитит всё в Gemini разом.
-PHOTO_STAGING_CAP = 20
+PHOTO_STAGING_CAP = int(os.environ.get("PHOTO_STAGING_CAP", "20"))
+PHOTO_BYTES_CAP = int(os.environ.get("PHOTO_BYTES_CAP", str(12 * 1024 * 1024)))
+PHOTO_STAGING_TTL = int(os.environ.get("PHOTO_STAGING_TTL", "1800"))
 _photo_lock = threading.Lock()
 _photo_commit_lock = threading.Lock()  # не более одного коммита одновременно (гонка двух commit)
-_photo_staging: list = []       # сырые JPEG-байты кадров
+_photo_staging: list = []       # список (jpeg_bytes, enqueued_at)
 _photo_status = "idle"          # idle | staged | sent_to_llm | txt_ready | consumed | error
+
+
+def _sweep_photo_staging_locked(now: float):
+    global _photo_status
+    if not _photo_staging:
+        return
+    kept = [(b, t) for (b, t) in _photo_staging if now - t <= PHOTO_STAGING_TTL]
+    if len(kept) != len(_photo_staging):
+        dropped = len(_photo_staging) - len(kept)
+        _photo_staging[:] = kept
+        if not _photo_staging:
+            _photo_status = "idle"
+        print(f"[photo] sweep expired dropped={dropped} staged={len(_photo_staging)} ttl={PHOTO_STAGING_TTL}", flush=True)
+
+
+def _set_voice_busy(value: bool):
+    global _voice_busy
+    with _voice_busy_lock:
+        _voice_busy = value
+
+
+def _get_voice_busy() -> bool:
+    with _voice_busy_lock:
+        return _voice_busy
+
+
+@app.errorhandler(413)
+def _too_large(e):
+    size = request.content_length or 0
+    print(f"[http] 413 path={request.path} bytes={size}", flush=True)
+    return jsonify({"error": "request too large"}), 413
 
 
 def require_device_key():
@@ -131,14 +184,42 @@ def require_device_key():
     return key == DEVICE_KEY
 
 
+def _is_voice_source(source: str) -> bool:
+    return source.startswith("voice")
+
+
 def set_latest_result(text: str, source: str):
+    global _answer_seq
+    now = time.time()
     with _state_lock:
-        _state["ready"] = True
-        _state["text"] = text
-        _state["source"] = source
-        _state["created_at"] = time.time()
-    # Краткий лог ответа — виден в journalctl, упрощает отладку
+        _answer_seq += 1
+        slot = _voice_answer if _is_voice_source(source) else _photo_answer
+        slot["ready"] = True
+        slot["text"] = text
+        slot["source"] = source
+        slot["created_at"] = now
+        slot["seq"] = _answer_seq
     print(f"[answer] source={source} len={len(text)} preview={text[:100]!r}", flush=True)
+
+
+def _newest_ready_slot_locked():
+    best_name = None
+    best = None
+    for name, slot in (("photo", _photo_answer), ("voice", _voice_answer)):
+        if slot["ready"]:
+            if best is None or (slot["created_at"], slot["seq"]) > (best["created_at"], best["seq"]):
+                best_name = name
+                best = slot
+    return best_name, best
+
+
+def _honest_answer_ready_locked() -> bool:
+    _, best = _newest_ready_slot_locked()
+    if best is None:
+        return False
+    if _last_commit_failed and _last_commit_failed_at > best["created_at"]:
+        return False
+    return True
 
 
 def call_gemini(system_prompt: str, parts: list) -> str:
@@ -348,6 +429,13 @@ def handle_photos():
 
     images_b64 = payload["images"]
     print(f"[photos] ingress n={len(images_b64)}", flush=True)
+    if len(images_b64) > PHOTOS_MAX_IMAGES:
+        print(f"[photos] 413 n={len(images_b64)} cap={PHOTOS_MAX_IMAGES}", flush=True)
+        return jsonify({"error": "too many images"}), 413
+    total_b64 = sum(len(s) for s in images_b64 if isinstance(s, str))
+    if total_b64 > PHOTOS_MAX_TOTAL_B64:
+        print(f"[photos] 413 total_b64={total_b64} cap={PHOTOS_MAX_TOTAL_B64}", flush=True)
+        return jsonify({"error": "images too large"}), 413
 
     parts = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
     for img_b64 in images_b64:
@@ -418,6 +506,10 @@ def handle_voice_chunk():
         return jsonify({"error": "X-Chunk-Index must be >= 0"}), 400
 
     audio_bytes = request.get_data()
+    sid_tail = session_id[-6:] if len(session_id) > 6 else session_id
+    if len(audio_bytes) > VOICE_CHUNK_MAX_BYTES:
+        print(f"[voice] 413 sid_tail={sid_tail} bytes={len(audio_bytes)} cap={VOICE_CHUNK_MAX_BYTES}", flush=True)
+        return jsonify({"error": "chunk too large"}), 413
     if is_final:
         # Пустой финальный маркер допустим: кнопка стоп была нажата МЕЖДУ чанками
         # (во время отправки предыдущего) — склеиваем всё накопленное ранее.
@@ -426,7 +518,6 @@ def handle_voice_chunk():
     elif not audio_bytes or len(audio_bytes) <= 44:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
-    sid_tail = session_id[-6:] if len(session_id) > 6 else session_id
     print(f"[voice] chunk sid_tail={sid_tail} idx={chunk_index} bytes={len(audio_bytes)} final={is_final}", flush=True)
 
     # Очистка просроченных сессий (чтобы память не текла)
@@ -474,26 +565,29 @@ def handle_voice_chunk():
         print(f"[voice] merge fail reason=missing chunks sid_tail={sid_tail} expected={expected} got={ordered_keys}", flush=True)
         return jsonify({"error": f"missing chunks: expected {expected} got {ordered_keys}"}), 400
 
-    t_merge = time.monotonic()
+    _set_voice_busy(True)
     try:
-        merged_audio = merge_wav_chunks(chunks)
-    except RuntimeError as e:
-        print(f"[voice] merge fail reason={e} sid_tail={sid_tail} n={len(chunks)}", flush=True)
-        return jsonify({"error": f"failed to merge chunks: {e}"}), 400
-    merge_ms = int((time.monotonic() - t_merge) * 1000)
-    print(f"[voice] merge n={len(chunks)} bytes={len(merged_audio)} ms={merge_ms} sid_tail={sid_tail}", flush=True)
+        t_merge = time.monotonic()
+        try:
+            merged_audio = merge_wav_chunks(chunks)
+        except RuntimeError as e:
+            print(f"[voice] merge fail reason={e} sid_tail={sid_tail} n={len(chunks)}", flush=True)
+            return jsonify({"error": f"failed to merge chunks: {e}"}), 400
+        merge_ms = int((time.monotonic() - t_merge) * 1000)
+        print(f"[voice] merge n={len(chunks)} bytes={len(merged_audio)} ms={merge_ms} sid_tail={sid_tail}", flush=True)
 
-    # Единая STT-развилка (тот же helper, что у /api/voice): Groq STT либо аудио в Gemini.
-    try:
-        answer, stt_used, transcript = answer_voice(merged_audio)
-    except (requests.RequestException, RuntimeError):
-        return jsonify({"error": "gemini request failed"}), 502
+        try:
+            answer, stt_used, transcript = answer_voice(merged_audio)
+        except (requests.RequestException, RuntimeError):
+            return jsonify({"error": "gemini request failed"}), 502
 
-    set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
-    return jsonify({"ok": True, "final": True,
-                    "stt": "groq" if stt_used else "gemini_direct",
-                    "transcript": transcript,
-                    "text": answer})
+        set_latest_result(answer, source="voice_stt" if stt_used else "voice_chunks")
+        return jsonify({"ok": True, "final": True,
+                        "stt": "groq" if stt_used else "gemini_direct",
+                        "transcript": transcript,
+                        "text": answer})
+    finally:
+        _set_voice_busy(False)
 
 
 # ---------------------------------------------------------------------
@@ -505,22 +599,20 @@ def get_latest():
         return jsonify({"error": "unauthorized"}), 401
 
     with _state_lock:
-        result = dict(_state)
-        # После того как устройство забрало результат - помечаем как неготовый,
-        # чтобы одно и то же сообщение не показывалось повторно при следующем опросе.
-        if _state["ready"]:
-            _state["ready"] = False
+        name, best = _newest_ready_slot_locked()
+        if best is not None:
+            result = {"ready": True, "text": best["text"], "source": best["source"],
+                      "created_at": best["created_at"]}
+            best["ready"] = False
+        else:
+            result = {"ready": False, "text": "", "source": None, "created_at": 0}
 
-    # Отдали фото-ответ — переводим фото-статус в consumed (голосовой флоу не трогаем).
     if result.get("ready") and result.get("source") in ("photo", "photos_burst", "photos_commit"):
         global _photo_status
         with _photo_lock:
             _photo_status = "consumed"
         print(f"[photo] latest отдан, source={result.get('source')} status=consumed", flush=True)
 
-    # Используем json.dumps с ensure_ascii=False для сохранения русского текста.
-    # ВАЖНО: separators=(",", ":") даёт компактный JSON БЕЗ пробелов ({"ready":true,...}),
-    # т.к. прошивка microReader парсит ответ вручную через indexOf и ждёт точный формат.
     response_text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
@@ -536,13 +628,21 @@ def handle_photo_frame():
     image_bytes = request.get_data()
     if not image_bytes:
         return jsonify({"error": "empty body, expected raw JPEG bytes"}), 400
+    if len(image_bytes) > PHOTO_FRAME_MAX_BYTES:
+        print(f"[photo] 413 frame bytes={len(image_bytes)} cap={PHOTO_FRAME_MAX_BYTES}", flush=True)
+        return jsonify({"error": "frame too large"}), 413
 
     global _photo_status
     with _photo_lock:
+        _sweep_photo_staging_locked(time.time())
         if len(_photo_staging) >= PHOTO_STAGING_CAP:
             print(f"[photo] staging full bytes={len(image_bytes)} staged={len(_photo_staging)} cap={PHOTO_STAGING_CAP}", flush=True)
             return jsonify({"error": "staging full"}), 413
-        _photo_staging.append(image_bytes)
+        current_bytes = sum(len(b) for (b, _) in _photo_staging)
+        if current_bytes + len(image_bytes) > PHOTO_BYTES_CAP:
+            print(f"[photo] 413 bytes cap current={current_bytes} ingress={len(image_bytes)} cap={PHOTO_BYTES_CAP}", flush=True)
+            return jsonify({"error": "staging bytes full"}), 413
+        _photo_staging.append((image_bytes, time.time()))
         staged = len(_photo_staging)
         _photo_status = "staged"
 
@@ -563,9 +663,10 @@ def handle_photos_commit():
         return jsonify({"error": "commit already in progress"}), 429
     try:
         with _photo_lock:
+            _sweep_photo_staging_locked(time.time())
             if not _photo_staging:
                 return jsonify({"error": "no staged frames"}), 400
-            frames = list(_photo_staging)
+            frames = [b for (b, _) in _photo_staging]
             committed = len(frames)
             _photo_status = "sent_to_llm"
 
@@ -581,12 +682,14 @@ def handle_photos_commit():
             answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
         except (requests.RequestException, RuntimeError) as e:
             dt_ms = int((time.monotonic() - t0) * 1000)
-            # Стейджинг НЕ чистим — кадры остаются для повторного коммита
             with _photo_lock:
                 _photo_status = "error"
+            global _last_commit_failed, _last_commit_failed_at
             with _state_lock:
-                stale = bool(_state["ready"])
-                stale_source = _state.get("source")
+                _last_commit_failed = True
+                _last_commit_failed_at = time.time()
+                stale = _photo_answer["ready"] or _voice_answer["ready"]
+                stale_source = _photo_answer.get("source") if _photo_answer["ready"] else _voice_answer.get("source")
             if stale:
                 print(f"[photo] warn commit failed, stale answer kept source={stale_source}", flush=True)
             print(f"[gemini] commit fail err_class={type(e).__name__} ms={dt_ms} status=502", flush=True)
@@ -596,9 +699,9 @@ def handle_photos_commit():
 
         total_bytes = sum(len(f) for f in frames)
         set_latest_result(answer, source="photos_commit")
+        with _state_lock:
+            _last_commit_failed = False
         with _photo_lock:
-            # Prefix-pop: убираем ровно закоммиченный префикс; кадры, пришедшие
-            # во время вызова Gemini, остаются в стейджинге для следующего коммита.
             del _photo_staging[:committed]
             _photo_status = "txt_ready"
 
@@ -620,14 +723,10 @@ def get_photo_status():
         staged = len(_photo_staging)
         status = _photo_status
     with _state_lock:
-        # answer_ready для ЛЮБОГО готового ответа (фото и голос): меню UP
-        # забирает через GET /api/latest, который отдаёт любой source.
-        answer_ready = bool(_state["ready"])
+        answer_ready = _honest_answer_ready_locked()
+    voice_busy = _get_voice_busy()
 
-    # Компактный JSON БЕЗ пробелов (separators=(",",":")): прошивка microReader
-    # парсит ответ вручную через indexOf и ждёт точный формат без пробелов
-    # ("staged":N, "photo_status":"...", "answer_ready":true) — как /api/latest.
-    response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready},
+    response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready, "voice_busy": voice_busy},
                                ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
@@ -649,7 +748,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not GOOGLE_API_KEY:
-        print("ВНИМАНИЕ: переменная окружения GOOGLE_API_KEY не задана!")
+        sys.exit("GOOGLE_API_KEY is not set")
+    if DEVICE_KEY in ("", "change-me"):
+        sys.exit("DEVICE_KEY is not set (placeholder value)")
 
     # ВАЖНО: threaded=True обязателен! Обработка финального чанка занимает
     # 10-25 с (Groq STT + Gemini). Без потоков однопоточный dev-сервер
