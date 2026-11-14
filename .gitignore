@@ -25,10 +25,7 @@ venv/
 microReader-repo/
 
 # Служебные файлы агента (не часть проекта)
-.omo/boulder.json
-.omo/omo.free.jsonc
-.omo/run-continuation/
-.omo/omo.jsonc
+.omo/
 
 # Arduino build artifacts
 microreader/firmware/a-microReader-v1.2/build/
