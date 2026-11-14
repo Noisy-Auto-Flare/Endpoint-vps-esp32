@@ -121,6 +121,7 @@ _voice_sessions = {}
 # Короткие нажатия складывают кадры сюда, удержание коммитит всё в Gemini разом.
 PHOTO_STAGING_CAP = 20
 _photo_lock = threading.Lock()
+_photo_commit_lock = threading.Lock()  # не более одного коммита одновременно (гонка двух commit)
 _photo_staging: list = []       # сырые JPEG-байты кадров
 _photo_status = "idle"          # idle | staged | sent_to_llm | txt_ready | consumed | error
 
@@ -257,10 +258,12 @@ def answer_voice(wav_bytes: bytes):
     transcript = ""
     if GROQ_STT_ENABLED and GROQ_API_KEY:
         try:
+            groq_t0 = time.monotonic()
             transcript = transcribe_groq(wav_bytes)
+            groq_ms = int((time.monotonic() - groq_t0) * 1000)
             if transcript:
                 stt_used = True
-                print(f"[stt] groq ok, model={GROQ_STT_MODEL} len={len(transcript)} "
+                print(f"[stt] groq ok, model={GROQ_STT_MODEL} ms={groq_ms} len={len(transcript)} "
                       f"preview={transcript[:100]!r}", flush=True)
             else:
                 print("[stt] groq вернул пустой текст; fallback на Gemini audio", flush=True)
@@ -311,6 +314,7 @@ def handle_photo():
 
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
+    t0 = time.monotonic()
     try:
         answer = call_gemini(
             PHOTO_SYSTEM_PROMPT,
@@ -320,8 +324,11 @@ def handle_photo():
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
-        print(f"[gemini] photo fail err_class={type(e).__name__} status=502", flush=True)
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[gemini] photo fail err_class={type(e).__name__} ms={dt_ms} status=502", flush=True)
         return jsonify({"error": "gemini request failed"}), 502
+    dt_ms = int((time.monotonic() - t0) * 1000)
+    print(f"[gemini] photo ok ms={dt_ms} bytes={len(image_bytes)}", flush=True)
 
     set_latest_result(answer, source="photo")
     return jsonify({"ok": True, "text": answer})
@@ -346,11 +353,15 @@ def handle_photos():
     for img_b64 in images_b64:
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
 
+    t0 = time.monotonic()
     try:
         answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
     except (requests.RequestException, RuntimeError) as e:
-        print(f"[gemini] photos fail err_class={type(e).__name__} status=502", flush=True)
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[gemini] photos fail err_class={type(e).__name__} ms={dt_ms} n={len(images_b64)} status=502", flush=True)
         return jsonify({"error": "gemini request failed"}), 502
+    dt_ms = int((time.monotonic() - t0) * 1000)
+    print(f"[gemini] photos ok ms={dt_ms} n={len(images_b64)}", flush=True)
 
     set_latest_result(answer, source="photos_burst")
     return jsonify({"ok": True, "text": answer})
@@ -548,48 +559,53 @@ def handle_photos_commit():
         return jsonify({"error": "unauthorized"}), 401
 
     global _photo_status
-    with _photo_lock:
-        if not _photo_staging:
-            return jsonify({"error": "no staged frames"}), 400
-        frames = list(_photo_staging)
-        committed = len(frames)
-        _photo_status = "sent_to_llm"
-
-    print(f"[photo] commit, frames={len(frames)} status=sent_to_llm", flush=True)
-
-    parts: list = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
-    for frame in frames:
-        parts.append({"inline_data": {"mime_type": "image/jpeg",
-                                      "data": base64.b64encode(frame).decode("utf-8")}})
-
-    t0 = time.monotonic()
+    if not _photo_commit_lock.acquire(blocking=False):
+        return jsonify({"error": "commit already in progress"}), 429
     try:
-        answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
-    except (requests.RequestException, RuntimeError) as e:
-        dt_ms = int((time.monotonic() - t0) * 1000)
-        # Стейджинг НЕ чистим — кадры остаются для повторного коммита
         with _photo_lock:
-            _photo_status = "error"
-        with _state_lock:
-            stale = bool(_state["ready"])
-            stale_source = _state.get("source")
-        if stale:
-            print(f"[photo] warn commit failed, stale answer kept source={stale_source}", flush=True)
-        print(f"[gemini] commit fail err_class={type(e).__name__} ms={dt_ms} status=502", flush=True)
-        return jsonify({"error": "gemini request failed"}), 502
-    dt_ms = int((time.monotonic() - t0) * 1000)
-    print(f"[gemini] commit ok ms={dt_ms} frames={len(frames)}", flush=True)
+            if not _photo_staging:
+                return jsonify({"error": "no staged frames"}), 400
+            frames = list(_photo_staging)
+            committed = len(frames)
+            _photo_status = "sent_to_llm"
 
-    total_bytes = sum(len(f) for f in frames)
-    set_latest_result(answer, source="photos_commit")
-    with _photo_lock:
-        # Prefix-pop: убираем ровно закоммиченный префикс; кадры, пришедшие
-        # во время вызова Gemini, остаются в стейджинге для следующего коммита.
-        del _photo_staging[:committed]
-        _photo_status = "txt_ready"
+        print(f"[photo] commit, frames={len(frames)} status=sent_to_llm", flush=True)
 
-    print(f"[photo] commit ok, frames={len(frames)} bytes={total_bytes} ms={dt_ms} status=txt_ready", flush=True)
-    return jsonify({"ok": True, "frames": len(frames), "text": answer})
+        parts: list = [{"text": "Проанализируй эту серию из нескольких фото (сделаны одно за другим)."}]
+        for frame in frames:
+            parts.append({"inline_data": {"mime_type": "image/jpeg",
+                                          "data": base64.b64encode(frame).decode("utf-8")}})
+
+        t0 = time.monotonic()
+        try:
+            answer = call_gemini(PHOTO_SYSTEM_PROMPT, parts)
+        except (requests.RequestException, RuntimeError) as e:
+            dt_ms = int((time.monotonic() - t0) * 1000)
+            # Стейджинг НЕ чистим — кадры остаются для повторного коммита
+            with _photo_lock:
+                _photo_status = "error"
+            with _state_lock:
+                stale = bool(_state["ready"])
+                stale_source = _state.get("source")
+            if stale:
+                print(f"[photo] warn commit failed, stale answer kept source={stale_source}", flush=True)
+            print(f"[gemini] commit fail err_class={type(e).__name__} ms={dt_ms} status=502", flush=True)
+            return jsonify({"error": "gemini request failed"}), 502
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[gemini] commit ok ms={dt_ms} frames={len(frames)}", flush=True)
+
+        total_bytes = sum(len(f) for f in frames)
+        set_latest_result(answer, source="photos_commit")
+        with _photo_lock:
+            # Prefix-pop: убираем ровно закоммиченный префикс; кадры, пришедшие
+            # во время вызова Gemini, остаются в стейджинге для следующего коммита.
+            del _photo_staging[:committed]
+            _photo_status = "txt_ready"
+
+        print(f"[photo] commit ok, frames={len(frames)} bytes={total_bytes} ms={dt_ms} status=txt_ready", flush=True)
+        return jsonify({"ok": True, "frames": len(frames), "text": answer})
+    finally:
+        _photo_commit_lock.release()
 
 
 # ---------------------------------------------------------------------
