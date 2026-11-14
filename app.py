@@ -63,18 +63,25 @@ GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3")
 GROQ_STT_LANGUAGE = os.environ.get("GROQ_STT_LANGUAGE", "ru")
 GROQ_API_BASE = "https://api.groq.com/openai/v1"
 
-# Системный промпт для голосовых запросов напрямую по аудио (можно менять под задачу)
-VOICE_AUDIO_PROMPT = os.environ.get(
-    "VOICE_AUDIO_PROMPT",
-    "Ты — голосовой ассистент школьника на маленьком устройстве. "
-    "Тебе присылают аудио с голосовым вопросом или заданием пользователя — слушай аудио внимательно. "
-    "Отвечай ПОДРОБНО, строго в трёх частях по порядку: "
-    "1) СНАЧАЛА опиши, как ты понял задание: перескажи, что именно услышал в аудио и что требуется сделать. "
+# Общий хвост голосовых промптов: 3-part структура + запрет markdown (wording идентичен
+# для аудио- и транскрипт-путей; различаются только source-предложения про аудио/расшифровку).
+_VOICE_COMMON_TAIL = (
     "2) ЗАТЕМ очень подробно объясни ход решения: почему ответ такой, а не другой, "
     "обоснуй каждый шаг простыми словами, как учитель для ученика. "
     "3) В КОНЦЕ чётко назови итоговый ответ. "
     "Никакой markdown-разметки и специальных символов (звёздочки, решётки, доллары запрещены) — "
     "только обычный текст, который удобно читать вслух или на маленьком экране. "
+)
+_VOICE_3PART_HEAD = "Отвечай ПОДРОБНО, строго в трёх частях по порядку: "
+
+# Системный промпт для голосовых запросов напрямую по аудио (можно менять под задачу)
+VOICE_AUDIO_PROMPT = os.environ.get(
+    "VOICE_AUDIO_PROMPT",
+    "Ты — голосовой ассистент школьника на маленьком устройстве. "
+    "Тебе присылают аудио с голосовым вопросом или заданием пользователя — слушай аудио внимательно. "
+    + _VOICE_3PART_HEAD +
+    "1) СНАЧАЛА опиши, как ты понял задание: перескажи, что именно услышал в аудио и что требуется сделать. "
+    + _VOICE_COMMON_TAIL +
     "Если в аудио не задание, а просто вопрос — отвечай подробно и по существу."
 )
 
@@ -83,13 +90,9 @@ VOICE_TRANSCRIPT_PROMPT = os.environ.get(
     "VOICE_TRANSCRIPT_PROMPT",
     "Ты — голосовой ассистент школьника на маленьком устройстве. "
     "Тебе присылают расшифровку голосового вопроса или задания пользователя текстом. "
-    "Отвечай ПОДРОБНО, строго в трёх частях по порядку: "
+    + _VOICE_3PART_HEAD +
     "1) СНАЧАЛА опиши, как ты понял задание: перескажи, что именно сказано в расшифровке и что требуется сделать. "
-    "2) ЗАТЕМ очень подробно объясни ход решения: почему ответ такой, а не другой, "
-    "обоснуй каждый шаг простыми словами, как учитель для ученика. "
-    "3) В КОНЦЕ чётко назови итоговый ответ. "
-    "Никакой markdown-разметки и специальных символов (звёздочки, решётки, доллары запрещены) — "
-    "только обычный текст, который удобно читать вслух или на маленьком экране. "
+    + _VOICE_COMMON_TAIL +
     "Если в расшифровке не задание, а просто вопрос — отвечай подробно и по существу."
 )
 
@@ -324,10 +327,6 @@ def merge_wav_chunks(chunks: list) -> bytes:
         if len(chunk) <= 44:
             continue  # пустой финальный маркер или заголовок без данных
         data_off = _wav_data_offset(chunk)
-        if data_off != 44:
-            raise RuntimeError(
-                f"unsupported wav format: unexpected data offset={data_off} len={len(chunk)}"
-            )
         data_parts.append(chunk[data_off:])
         total_data_size += len(chunk) - data_off
 
@@ -681,6 +680,17 @@ def get_latest():
             _photo_status = "consumed"
         print(f"[photo] latest отдан, source={result.get('source')} status=consumed", flush=True)
 
+    if result.get("ready") and _is_voice_source(result.get("source") or ""):
+        with _photo_lock:
+            _staging_empty = not _photo_staging
+        with _state_lock:
+            _photo_ready = _photo_answer["ready"]
+        if _staging_empty and not _photo_ready:
+            with _photo_lock:
+                if not _photo_staging:
+                    _photo_status = "idle"
+            print("[photo] latest отдан voice, staging пуст и фото-слот не ready: status=idle", flush=True)
+
     response_text = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
@@ -820,10 +830,15 @@ if __name__ == "__main__":
     if DEVICE_KEY in ("", "change-me"):
         sys.exit("DEVICE_KEY is not set (placeholder value)")
 
-    print(f"[startup] model={GEMINI_MODEL} groq_stt={GROQ_STT_ENABLED} max_content_length={MAX_CONTENT_LENGTH} "
+    print(f"[startup] model={GEMINI_MODEL} groq_stt={GROQ_STT_ENABLED} groq_model={GROQ_STT_MODEL} "
+          f"groq_lang={GROQ_STT_LANGUAGE} max_content_length={MAX_CONTENT_LENGTH} "
           f"photo_max_bytes={PHOTO_MAX_BYTES} voice_max_bytes={VOICE_MAX_BYTES} "
           f"voice_max_sessions={VOICE_MAX_SESSIONS} voice_max_chunks={VOICE_MAX_CHUNKS} "
-          f"voice_session_ttl={VOICE_SESSION_TTL}", flush=True)
+          f"voice_chunk_max_bytes={VOICE_CHUNK_MAX_BYTES} voice_session_ttl={VOICE_SESSION_TTL} "
+          f"photo_frame_max_bytes={PHOTO_FRAME_MAX_BYTES} photos_max_images={PHOTOS_MAX_IMAGES} "
+          f"photos_max_total_b64={PHOTOS_MAX_TOTAL_B64} photo_staging_cap={PHOTO_STAGING_CAP} "
+          f"photo_bytes_cap={PHOTO_BYTES_CAP} photo_staging_ttl={PHOTO_STAGING_TTL} "
+          f"max_answer_chars={MAX_ANSWER_CHARS}", flush=True)
 
     # ВАЖНО: threaded=True обязателен! Обработка финального чанка занимает
     # 10-25 с (Groq STT + Gemini). Без потоков однопоточный dev-сервер
