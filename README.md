@@ -125,7 +125,7 @@ curl http://ТВОЙ_IP:8080/api/health
 | GET | `/api/health` | Проверка сервера (без ключа) |
 | POST | `/api/photo-frame` | Принять 1 JPEG-кадр в стейджинг (без отправки в Gemini) → `{"ok":true,"staged":N}`; ошибки: `400` пустое тело, `413 frame too large` (лимит `PHOTO_FRAME_MAX_BYTES`), `413 staging full` (лимит `PHOTO_STAGING_CAP`), `413 staging bytes full` (лимит `PHOTO_BYTES_CAP`) |
 | POST | `/api/photos/commit` | Отправить все staged-кадры в Gemini разом → `{"ok":true,"frames":N,"text":...}`; ошибки: `400` стейджинг пуст, **`429` коммит уже идёт**, `502` Gemini недоступен (кадры НЕ чистятся — можно повторить) |
-| GET | `/api/photo-status` | Статус стейджинга для microReader: `{"staged":N,"photo_status":"...","answer_ready":bool,"voice_busy":bool}` (компактный JSON без пробелов). `photo_status`: `idle`/`staged`/`sent_to_llm`/`txt_ready`/`consumed`/`error`. `answer_ready=true` — есть незабранный ответ в любом из двух слотов (см. честный `answer_ready` ниже); после неудачного коммита свежие ответы не предлагаются, пока коммит не пройдёт. `voice_busy=true` — идёт обработка голосового финала (склейка + Gemini). В режиме записи урока дополнительно: `voice_mode`, `lesson_chunks` (чанков в активной записи; 0, если активной записи нет) |
+| GET | `/api/photo-status` | Статус стейджинга для microReader: `{"staged":N,"photo_status":"...","answer_ready":bool,"voice_busy":bool}` (компактный JSON без пробелов). `photo_status`: `idle`/`staged`/`sent_to_llm`/`txt_ready`/`consumed`/`error`. `answer_ready=true` — есть незабранный ответ в любом из двух слотов (см. честный `answer_ready` ниже); после неудачного коммита свежие ответы не предлагаются, пока коммит не пройдёт. `voice_busy=true` — идёт обработка голосового финала (склейка + Gemini). В режиме записи урока дополнительно: `voice_mode`, `lesson_chunks` (чанков в активной записи, а при её отсутствии — чанков последнего завершённого урока; 0 только при старте) |
 | POST | `/api/photo` | Legacy: одиночное JPEG-фото сразу в Gemini (для старой прошивки/веб-страницы); ошибки: `400`, `413 photo too large` (лимит `PHOTO_MAX_BYTES`), `502` |
 | POST | `/api/photos` | Legacy: серия фото (JSON с base64) сразу в Gemini (для старой прошивки/веб-страницы); ошибки: `400`, `413` (`too many images` / `images too large`), `502` |
 | POST | `/api/voice` | Принять WAV-аудио целиком, отправить в Gemini; ошибки: `400`, `413 voice too large` (лимит `VOICE_MAX_BYTES`), `502` |
@@ -352,7 +352,7 @@ Content-Type: audio/wav    # тело — сырые байты WAV (16 кГц, 
 - Режимы: `qa` (по умолчанию, текущий: чанки → склейка → Gemini → ответ) и `lesson` (чанки складываются в файлы урока, БЕЗ вызова Gemini; `/api/latest` не обновляется, `answer_ready` остаётся `false`).
 - Микрофон НЕ знает о режиме: он всегда шлёт чанки как обычно, решает сервер. Одна запись (старт → стоп) = одна сессия = один WAV урока; лимит одной записи в прошивке поднят до 2 часов (`MAX_SECONDS=7200`), чтобы хватило на весь урок с одного нажатия в начале и одного в конце.
 - Переключение глобального режима (в памяти процесса): `POST /api/voice-mode` (`X-Device-Key`, JSON `{"mode":"qa"|"lesson"}`) → `{"ok":true,"mode":"lesson"}`; состояние: `GET /api/voice-mode` → `{"mode":"qa"|"lesson"}`.
-- microReader: в Меню 3 (мониторинг) строка «Режим: Урок» / «Режим: Вопрос-ответ» с переключением по OK (при включённом мониторинге); статус-строка в режиме урока: `чанков урока: N`. `GET /api/photo-status` дополнительно отдаёт `voice_mode` и `lesson_chunks`.
+- microReader: в Меню 3 (мониторинг) строка «Режим: Вопросы» / «Режим: Урок» с переключением по OK (при включённом мониторинге); статус-строка в режиме урока: `чанков урока: N`. `GET /api/photo-status` дополнительно отдаёт `voice_mode` и `lesson_chunks`.
 
 ### Где лежат файлы
 - Директория `lessons/` рядом с `app.py` (gitignored).
@@ -361,6 +361,10 @@ Content-Type: audio/wav    # тело — сырые байты WAV (16 кГц, 
 
 ### Env-кнобы
 - `LESSON_MAX_CHUNKS` — лимит чанков в режиме урока (дефолт 2000 ≈ 2.7 ч при чанках по 5 сек). Общий `VOICE_CHUNK_MAX_BYTES` и TTL сессий (`VOICE_SESSION_TTL`) действуют как обычно.
+
+### Операционные заметки
+- Режим хранится в памяти процесса и сбрасывается в `qa` при рестарте сервера — перед уроком переключи снова и проверь `GET /api/voice-mode`.
+- TTL урока — idle-таймаут: чанки держат сессию живой, при обрыве Wi-Fi дольше `VOICE_SESSION_TTL` сессия сгорает и следующий чанк начнёт новый файл урока.
 
 ### Рабочий процесс
 1. В microReader Меню 3 (или `curl POST /api/voice-mode`) переключи режим в `lesson`.
