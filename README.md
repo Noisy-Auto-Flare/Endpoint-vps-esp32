@@ -125,11 +125,13 @@ curl http://ТВОЙ_IP:8080/api/health
 | GET | `/api/health` | Проверка сервера (без ключа) |
 | POST | `/api/photo-frame` | Принять 1 JPEG-кадр в стейджинг (без отправки в Gemini) → `{"ok":true,"staged":N}`; ошибки: `400` пустое тело, `413 frame too large` (лимит `PHOTO_FRAME_MAX_BYTES`), `413 staging full` (лимит `PHOTO_STAGING_CAP`), `413 staging bytes full` (лимит `PHOTO_BYTES_CAP`) |
 | POST | `/api/photos/commit` | Отправить все staged-кадры в Gemini разом → `{"ok":true,"frames":N,"text":...}`; ошибки: `400` стейджинг пуст, **`429` коммит уже идёт**, `502` Gemini недоступен (кадры НЕ чистятся — можно повторить) |
-| GET | `/api/photo-status` | Статус стейджинга для microReader: `{"staged":N,"photo_status":"...","answer_ready":bool,"voice_busy":bool}` (компактный JSON без пробелов). `photo_status`: `idle`/`staged`/`sent_to_llm`/`txt_ready`/`consumed`/`error`. `answer_ready=true` — есть незабранный ответ в любом из двух слотов (см. честный `answer_ready` ниже); после неудачного коммита свежие ответы не предлагаются, пока коммит не пройдёт. `voice_busy=true` — идёт обработка голосового финала (склейка + Gemini) |
+| GET | `/api/photo-status` | Статус стейджинга для microReader: `{"staged":N,"photo_status":"...","answer_ready":bool,"voice_busy":bool}` (компактный JSON без пробелов). `photo_status`: `idle`/`staged`/`sent_to_llm`/`txt_ready`/`consumed`/`error`. `answer_ready=true` — есть незабранный ответ в любом из двух слотов (см. честный `answer_ready` ниже); после неудачного коммита свежие ответы не предлагаются, пока коммит не пройдёт. `voice_busy=true` — идёт обработка голосового финала (склейка + Gemini). В режиме записи урока дополнительно: `voice_mode`, `lesson_chunks`
 | POST | `/api/photo` | Legacy: одиночное JPEG-фото сразу в Gemini (для старой прошивки/веб-страницы); ошибки: `400`, `413 photo too large` (лимит `PHOTO_MAX_BYTES`), `502` |
 | POST | `/api/photos` | Legacy: серия фото (JSON с base64) сразу в Gemini (для старой прошивки/веб-страницы); ошибки: `400`, `413` (`too many images` / `images too large`), `502` |
 | POST | `/api/voice` | Принять WAV-аудио целиком, отправить в Gemini; ошибки: `400`, `413 voice too large` (лимит `VOICE_MAX_BYTES`), `502` |
 | POST | `/api/voice-chunk` | Принять WAV-чанк (5 сек) от ESP32-C3; при `X-Final: true` склеить сессию и распознать речь: Groq Whisper → текст → Gemini (резерв: аудио сразу в Gemini). Ошибки: `400` (нет `X-Session-Id`, плохой индекс, дырки в чанках), `413 chunk too large` (лимит `VOICE_CHUNK_MAX_BYTES`), `413 too many sessions` (лимит `VOICE_MAX_SESSIONS`), **`413` слишком много чанков — сессия сбрасывается** (лимит `VOICE_MAX_CHUNKS`), `502` |
+| GET | `/api/voice-mode` | Текущий режим голоса: `{"mode":"qa"|"lesson"}` (глобальный режим в памяти процесса) |
+| POST | `/api/voice-mode` | Переключить режим голоса: JSON `{"mode":"qa"|"lesson"}` → `{"ok":true,"mode":"lesson"}` |
 | GET | `/api/latest` | Отдать newest ready из двух слотов (фото + голос) **однократно** — потребляется только отданный слот, второй остаётся. Поле `source`: `photo` / `photos_burst` / `photos_commit` / `voice` / `voice_chunks` / `voice_stt`. Голос не затирает фото и наоборот; повторный опрос — `ready:false` |
 
 Все эндпоинты (кроме `/api/health`) требуют заголовок `X-Device-Key`, без него — `401 unauthorized`. Тело больше `MAX_CONTENT_LENGTH` → `413 request too large` на любом эндпоинте.
@@ -180,6 +182,7 @@ curl http://ТВОЙ_IP:8080/api/latest \
 | `PHOTOS_MAX_TOTAL_B64` | 6291456 (6 МБ) | Бэкенд: суммарный base64 в `POST /api/photos`; больше → `413 images too large` |
 | `VOICE_CHUNK_MAX_BYTES` | 1048576 (1 МБ) | Бэкенд: один чанк `POST /api/voice-chunk`; больше → `413 chunk too large` |
 | `VOICE_MAX_CHUNKS` | 20 чанков (~100 сек при чанках по 5 сек) | Бэкенд, env-knob (`VOICE_MAX_CHUNKS`, дефолт 20): лишний чанк → `413`, сессия сбрасывается |
+| `LESSON_MAX_CHUNKS` | 2000 чанков (~2.7 ч при чанках по 5 сек) | Бэкенд, env-knob (`LESSON_MAX_CHUNKS`, дефолт 2000): лимит чанков в режиме записи урока; общий `VOICE_CHUNK_MAX_BYTES` и TTL сессий |
 | `VOICE_SESSION_TTL` | 600 сек | Бэкенд, env-knob (`VOICE_SESSION_TTL`, дефолт 600): сессия без финального чанка сгорает (чистка при следующем чанке) |
 | `VOICE_MAX_SESSIONS` | 50 | Бэкенд: макс. голосовых сессий в `POST /api/voice-chunk`; больше → `413 too many sessions` |
 | `VOICE_MAX_BYTES` | 2097152 (2 МБ) | Бэкенд: целиком `POST /api/voice`; больше → `413 voice too large` |
@@ -334,6 +337,32 @@ X-Chunk-Index: <0, 1, 2, ...>
 X-Final: true|false        # true только на последнем чанке
 Content-Type: audio/wav    # тело — сырые байты WAV (16 кГц, 16 бит, моно)
 ```
+
+---
+
+## Режим записи урока
+
+Второй режим голоса: друг приносит микрофон в школу, в начале урока включает запись, в конце выключает. Записи копятся на сервере в `lessons/`, без вызова Gemini — Gemini тратится потом, вручную владельцем на компьютере. Первый режим (`qa`, вопрос-ответ) остаётся по умолчанию.
+
+### Что это
+- Режимы: `qa` (по умолчанию, текущий: чанки → склейка → Gemini → ответ) и `lesson` (чанки складываются в файлы урока, БЕЗ вызова Gemini; `/api/latest` не обновляется, `answer_ready` остаётся `false`).
+- Микрофон НЕ знает о режиме: он всегда шлёт чанки как обычно, сервер сам решает, что с ними делать. Прошивка ESP32-C3 не меняется.
+- Переключение глобального режима (в памяти процесса): `POST /api/voice-mode` (`X-Device-Key`, JSON `{"mode":"qa"|"lesson"}`) → `{"ok":true,"mode":"lesson"}`; состояние: `GET /api/voice-mode` → `{"mode":"qa"|"lesson"}`.
+- microReader: в Меню 3 (мониторинг) строка «Режим: Урок» / «Режим: Вопрос-ответ» с переключением по OK (при включённом мониторинге); статус-строка в режиме урока: `чанков урока: N`. `GET /api/photo-status` дополнительно отдаёт `voice_mode` и `lesson_chunks`.
+
+### Где лежат файлы
+- Директория `lessons/` рядом с `app.py` (gitignored).
+- Одна сессия записи = один накопитель: `lessons/lesson_YYYY-MM-DD_HH-MM-SS_<sid>.wav` (время в имени — время ПЕРВОГО чанка, начало урока). Каждый чанк дописывается в конец, заголовок RIFF обновляется при каждом дописывании (файл не битый при обрыве питания).
+- Рядом — sidecar `lessons/lesson_YYYY-MM-DD_HH-MM-SS_<sid>.json`: `{"sid":..., "started_at":..., "ended_at":..., "chunks":N, "duration_sec":...}`.
+
+### Env-кнобы
+- `LESSON_MAX_CHUNKS` — лимит чанков в режиме урока (дефолт 2000 ≈ 2.7 ч при чанках по 5 сек). Общий `VOICE_CHUNK_MAX_BYTES` и TTL сессий (`VOICE_SESSION_TTL`) действуют как обычно.
+
+### Рабочий процесс
+1. В microReader Меню 3 (или `curl POST /api/voice-mode`) переключи режим в `lesson`.
+2. На ESP32-C3 работай как обычно (старт/стоп запись) — чанки уходят на сервер, Gemini не вызывается.
+3. Скопируй каталог `lessons/` на компьютер.
+4. Скармливай WAV (+ sidecar) любой LLM/Whisper самостоятельно для структурирования урока.
 
 ---
 
