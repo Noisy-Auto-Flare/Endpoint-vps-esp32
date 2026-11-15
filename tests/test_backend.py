@@ -80,6 +80,7 @@ class AuthTest(unittest.TestCase):
             ("post", "/api/voice-chunk", {"data": _wav(10), "headers": chunk_headers}),
             ("get", "/api/voice-mode", {}),
             ("post", "/api/voice-mode", {"json": {"mode": "lesson"}}),
+            ("post", "/api/device-ip", {}),
         ]:
             with self.subTest(path=path):
                 resp = getattr(client, method)(path, **kwargs)
@@ -191,7 +192,8 @@ class PhotoStatusTest(unittest.TestCase):
         _, client = fresh_app()
         body = client.get("/api/photo-status", headers=HEADERS).get_json()
         self.assertEqual(body, {"staged": 0, "photo_status": "idle", "answer_ready": False,
-                                "voice_busy": False, "voice_mode": "qa", "lesson_chunks": 0})
+                                "voice_busy": False, "voice_mode": "qa", "lesson_chunks": 0,
+                                "cam_ip": "", "voice_recording": False})
 
     def test_staged_shape(self):
         _, client = fresh_app()
@@ -557,7 +559,8 @@ class CompactJsonTest(unittest.TestCase):
         self.assertEqual(resp.mimetype, "application/json")
         raw = resp.get_data(as_text=True)
         self.assertIn('"staged":0', raw)
-        self.assertIn('"voice_busy":false,"voice_mode":"qa","lesson_chunks":0}', raw)
+        self.assertIn('"voice_busy":false,"voice_mode":"qa","lesson_chunks":0,'
+                      '"cam_ip":"","voice_recording":false}', raw)
         self.assertNotIn('": ', raw)
         self.assertNotIn('": ', raw)
 
@@ -1068,9 +1071,11 @@ class LessonModeTest(unittest.TestCase):
         body = client.get("/api/photo-status", headers=HEADERS).get_json()
         self.assertEqual(body["voice_mode"], "lesson")
         self.assertEqual(body["lesson_chunks"], 1)
-        self.assertEqual(list(body)[-2:], ["voice_mode", "lesson_chunks"])
+        self.assertEqual(list(body)[-2:], ["cam_ip", "voice_recording"])
+        # Чанк не финальный — запись идёт, поэтому voice_recording=true.
         raw = client.get("/api/photo-status", headers=HEADERS).get_data(as_text=True)
-        self.assertTrue(raw.endswith('"voice_mode":"lesson","lesson_chunks":1}'))
+        self.assertTrue(raw.endswith(
+            '"voice_mode":"lesson","lesson_chunks":1,"cam_ip":"","voice_recording":true}'))
 
     def test_lesson_mode_initial_chunks_zero(self):
         mod, client, _ = self._lesson_app()
@@ -1192,6 +1197,151 @@ class LessonModeTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(os.path.isdir(lessons) and os.listdir(lessons))
         self.assertEqual(mod._lesson_sessions, {})
+
+
+class DeviceIpTest(unittest.TestCase):
+    """POST /api/device-ip и необязательный X-Device-Ip на фото-роутах."""
+
+    def _cam_ip(self, mod):
+        with mod._photo_lock:
+            return mod._cam_ip
+
+    def test_stores_stripped_ip(self):
+        mod, client = fresh_app()
+        resp = client.post("/api/device-ip",
+                           headers=dict(HEADERS, **{"X-Device-Ip": "  192.168.1.42 "}))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"ok": True, "cam_ip": "192.168.1.42"})
+        self.assertEqual(self._cam_ip(mod), "192.168.1.42")
+
+    def test_missing_header_400(self):
+        _, client = fresh_app()
+        resp = client.post("/api/device-ip", headers=HEADERS)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("error", resp.get_json())
+
+    def test_invalid_header_400_keeps_previous(self):
+        mod, client = fresh_app()
+        client.post("/api/device-ip",
+                    headers=dict(HEADERS, **{"X-Device-Ip": "192.168.1.7"}))
+        for bad in ("x" * 46, "192.168.1.5\x07", "192.168.1.5\t9"):
+            with self.subTest(bad=bad[:12]):
+                resp = client.post("/api/device-ip",
+                                   headers=dict(HEADERS, **{"X-Device-Ip": bad}))
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("error", resp.get_json())
+        self.assertEqual(self._cam_ip(mod), "192.168.1.7")
+
+    def test_photo_frame_updates_cam_ip(self):
+        mod, client = fresh_app()
+        resp = client.post("/api/photo-frame",
+                           headers=dict(HEADERS, **{"X-Device-Ip": "10.0.0.7"}),
+                           data=FAKE_JPEG)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._cam_ip(mod), "10.0.0.7")
+
+    def test_photo_frame_invalid_header_ignored(self):
+        mod, client = fresh_app()
+        resp = client.post("/api/photo-frame",
+                           headers=dict(HEADERS, **{"X-Device-Ip": "x" * 100}),
+                           data=FAKE_JPEG)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self._cam_ip(mod), "")
+
+    def test_legacy_photo_routes_update_cam_ip(self):
+        mod, client = fresh_app()
+        with mock.patch.object(mod, "call_gemini", return_value="x"):
+            r1 = client.post("/api/photo",
+                             headers=dict(HEADERS, **{"X-Device-Ip": "10.0.0.1"}),
+                             data=FAKE_JPEG)
+            self.assertEqual(r1.status_code, 200)
+            self.assertEqual(self._cam_ip(mod), "10.0.0.1")
+            b64 = base64.b64encode(FAKE_JPEG).decode("ascii")
+            r2 = client.post("/api/photos",
+                             headers=dict(HEADERS, **{"X-Device-Ip": "10.0.0.2"}),
+                             json={"images": [b64]})
+            self.assertEqual(r2.status_code, 200)
+            self.assertEqual(self._cam_ip(mod), "10.0.0.2")
+            client.post("/api/photo-frame", headers=HEADERS, data=FAKE_JPEG)
+            r3 = client.post("/api/photos/commit",
+                             headers=dict(HEADERS, **{"X-Device-Ip": "10.0.0.3"}))
+            self.assertEqual(r3.status_code, 200)
+            self.assertEqual(self._cam_ip(mod), "10.0.0.3")
+
+
+class PhotoStatusCamIpTailTest(unittest.TestCase):
+    def test_tail_keys_and_compact_json(self):
+        _, client = fresh_app()
+        client.post("/api/device-ip",
+                    headers=dict(HEADERS, **{"X-Device-Ip": "192.168.4.9"}))
+        resp = client.get("/api/photo-status", headers=HEADERS)
+        self.assertEqual(resp.mimetype, "application/json")
+        raw = resp.get_data(as_text=True)
+        body = json.loads(raw)
+        self.assertEqual(list(body)[-2:], ["cam_ip", "voice_recording"])
+        self.assertEqual(body["cam_ip"], "192.168.4.9")
+        self.assertFalse(body["voice_recording"])
+        self.assertTrue(raw.endswith('"cam_ip":"192.168.4.9","voice_recording":false}'))
+        self.assertNotIn('": ', raw)
+        self.assertNotIn(", ", raw)
+
+
+class VoiceRecordingStatusTest(unittest.TestCase):
+    def _hdr(self, sid, idx, final=False):
+        d = dict(HEADERS, **{"X-Session-Id": sid, "X-Chunk-Index": str(idx),
+                             "Content-Type": "audio/wav"})
+        if final:
+            d["X-Final"] = "true"
+        return d
+
+    def test_true_after_non_final_false_after_final(self):
+        mod, client = fresh_app()
+        r0 = client.post("/api/voice-chunk", headers=self._hdr("vrec1", 0), data=_wav(10))
+        self.assertEqual(r0.status_code, 200)
+        self.assertTrue(
+            client.get("/api/photo-status", headers=HEADERS).get_json()["voice_recording"])
+        with mock.patch.object(mod, "call_gemini", return_value="v"):
+            r1 = client.post("/api/voice-chunk", headers=self._hdr("vrec1", 1, final=True),
+                             data=_wav(10))
+        self.assertEqual(r1.status_code, 200)
+        self.assertFalse(
+            client.get("/api/photo-status", headers=HEADERS).get_json()["voice_recording"])
+
+    def test_lesson_path_marks_recording(self):
+        mod, client = fresh_app()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mod.LESSONS_DIR = tmp.name
+
+        def _close_sessions():
+            with mod._lesson_lock:
+                for sid in list(mod._lesson_sessions):
+                    mod._finalize_lesson_locked(sid, time.time(), reason="test")
+
+        # LIFO: сначала закрываем открытые файлы, потом удаляем временную папку.
+        self.addCleanup(_close_sessions)
+        resp = client.post("/api/voice-mode", headers=HEADERS, json={"mode": "lesson"})
+        self.assertEqual(resp.status_code, 200)
+        client.post("/api/voice-chunk", headers=self._hdr("vless", 0), data=_wav(10))
+        self.assertTrue(
+            client.get("/api/photo-status", headers=HEADERS).get_json()["voice_recording"])
+        client.post("/api/voice-chunk", headers=self._hdr("vless", 1, final=True),
+                    data=_wav(10))
+        self.assertFalse(
+            client.get("/api/photo-status", headers=HEADERS).get_json()["voice_recording"])
+
+    def test_window_expiry_false(self):
+        mod, client = fresh_app()
+        client.post("/api/voice-chunk", headers=self._hdr("vwin", 0), data=_wav(10))
+        with mod._voice_activity_lock:
+            mod._last_voice_chunk_at = time.monotonic() - mod.VOICE_ACTIVE_WINDOW - 1
+        self.assertFalse(
+            client.get("/api/photo-status", headers=HEADERS).get_json()["voice_recording"])
+
+    def test_default_window_12(self):
+        os.environ.pop("VOICE_ACTIVE_WINDOW", None)
+        mod, _ = fresh_app()
+        self.assertEqual(mod.VOICE_ACTIVE_WINDOW, 12)
 
 
 if __name__ == "__main__":

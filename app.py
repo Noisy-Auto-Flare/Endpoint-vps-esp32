@@ -111,6 +111,9 @@ VOICE_MAX_CHUNKS = int(os.environ.get("VOICE_MAX_CHUNKS", "20"))            # м
 LESSON_MAX_CHUNKS = int(os.environ.get("LESSON_MAX_CHUNKS", "2000"))
 VOICE_CHUNK_MAX_BYTES = int(os.environ.get("VOICE_CHUNK_MAX_BYTES", str(1 * 1024 * 1024)))
 VOICE_MAX_SESSIONS = int(os.environ.get("VOICE_MAX_SESSIONS", "50"))
+# Окно активности микрофона (сек): чанк моложе него = запись идёт.
+# Ридер показывает состояние записи по полю voice_recording в /api/photo-status.
+VOICE_ACTIVE_WINDOW = int(os.environ.get("VOICE_ACTIVE_WINDOW", "12"))
 PHOTO_MAX_BYTES = int(os.environ.get("PHOTO_MAX_BYTES", str(2 * 1024 * 1024)))
 VOICE_MAX_BYTES = int(os.environ.get("VOICE_MAX_BYTES", str(2 * 1024 * 1024)))
 
@@ -180,6 +183,16 @@ _photo_commit_lock = threading.Lock()  # не более одного комми
 _photo_staging: list = []       # список (jpeg_bytes, enqueued_at)
 _photo_status = "idle"          # idle | staged | sent_to_llm | txt_ready | consumed | error
 
+# IP ESP32-CAM из заголовка X-Device-Ip (шлёт при загрузке и с каждым запросом).
+# Живёт под _photo_lock вместе со стейджингом: оба — состояние одной связки устройств.
+CAM_IP_MAX_CHARS = 45           # IPv6-адрес в текстовом виде влезает с запасом
+_cam_ip = ""
+
+# Признак идущей записи голоса: monotonic-время последнего принятого чанка.
+# 0 — запись остановлена (пришёл финальный чанк).
+_voice_activity_lock = threading.Lock()
+_last_voice_chunk_at = 0.0
+
 
 def _sweep_photo_staging_locked(now: float):
     global _photo_status
@@ -203,6 +216,42 @@ def _set_voice_busy(value: bool):
 def _get_voice_busy() -> bool:
     with _voice_busy_lock:
         return _voice_busy
+
+
+def _normalize_cam_ip(raw: str):
+    """Валидирует X-Device-Ip: strip, до 45 символов, только printable ASCII."""
+    ip = (raw or "").strip()
+    if not ip or len(ip) > CAM_IP_MAX_CHARS:
+        return "", False
+    if not all(32 <= ord(ch) <= 126 for ch in ip):
+        return "", False
+    return ip, True
+
+
+def _update_cam_ip(raw: str) -> bool:
+    """Сохраняет IP CAM, если заголовок валиден. Лог — только при смене адреса."""
+    global _cam_ip
+    ip, ok = _normalize_cam_ip(raw)
+    if not ok:
+        return False
+    with _photo_lock:
+        if ip == _cam_ip:
+            return True
+        _cam_ip = ip
+    print(f"[cam] ip change ip={ip}", flush=True)
+    return True
+
+
+def _set_voice_activity(is_final: bool):
+    """Отмечает активность микрофона: чанк идёт или запись остановлена финалом."""
+    global _last_voice_chunk_at
+    with _voice_activity_lock:
+        _last_voice_chunk_at = 0.0 if is_final else time.monotonic()
+
+
+def _get_voice_activity() -> float:
+    with _voice_activity_lock:
+        return _last_voice_chunk_at
 
 
 @app.errorhandler(413)
@@ -467,6 +516,9 @@ def handle_photo():
     if not require_device_key():
         return jsonify({"error": "unauthorized"}), 401
 
+    # IP CAM (необязательный заголовок): обновляем молча, запрос не валим.
+    _update_cam_ip(request.headers.get("X-Device-Ip", ""))
+
     image_bytes = request.get_data()
     print(f"[photo] ingress bytes={len(image_bytes)}", flush=True)
     if not image_bytes:
@@ -504,6 +556,9 @@ def handle_photo():
 def handle_photos():
     if not require_device_key():
         return jsonify({"error": "unauthorized"}), 401
+
+    # IP CAM (необязательный заголовок): обновляем молча, запрос не валим.
+    _update_cam_ip(request.headers.get("X-Device-Ip", ""))
 
     payload = request.get_json(silent=True)
     if not payload or not isinstance(payload.get("images"), list) or not payload["images"]:
@@ -867,6 +922,9 @@ def handle_voice_chunk():
     elif not audio_bytes or len(audio_bytes) <= 44:
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
+    # Активность микрофона для мониторинга: не-финальный чанк = запись идёт.
+    _set_voice_activity(is_final)
+
     print(f"[voice] chunk sid_tail={sid_tail} idx={chunk_index} bytes={len(audio_bytes)} final={is_final}", flush=True)
 
     # Режим записи урока: микрофон всегда шлёт те же чанки, сервер сам решает,
@@ -992,12 +1050,33 @@ def get_latest():
 
 
 # ---------------------------------------------------------------------
+# POST /api/device-ip — ESP32-CAM сообщает свой IP (заголовок X-Device-Ip)
+# Тело пустое; ридер показывает адрес в мониторинге.
+# ---------------------------------------------------------------------
+@app.route("/api/device-ip", methods=["POST"])
+def handle_device_ip():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    raw = request.headers.get("X-Device-Ip", "")
+    ip, ok = _normalize_cam_ip(raw)
+    if not ok:
+        print(f"[cam] 400 bad ip header len={len(raw)}", flush=True)
+        return jsonify({"error": "invalid X-Device-Ip header"}), 400
+    _update_cam_ip(raw)
+    return jsonify({"ok": True, "cam_ip": ip})
+
+
+# ---------------------------------------------------------------------
 # POST /api/photo-frame — принять 1 JPEG в staging (без отправки в Gemini)
 # ---------------------------------------------------------------------
 @app.route("/api/photo-frame", methods=["POST"])
 def handle_photo_frame():
     if not require_device_key():
         return jsonify({"error": "unauthorized"}), 401
+
+    # IP CAM (необязательный заголовок): обновляем молча, запрос не валим.
+    _update_cam_ip(request.headers.get("X-Device-Ip", ""))
 
     image_bytes = request.get_data()
     if not image_bytes:
@@ -1031,6 +1110,9 @@ def handle_photo_frame():
 def handle_photos_commit():
     if not require_device_key():
         return jsonify({"error": "unauthorized"}), 401
+
+    # IP CAM (необязательный заголовок): обновляем молча, запрос не валим.
+    _update_cam_ip(request.headers.get("X-Device-Ip", ""))
 
     global _photo_status
     if not _photo_commit_lock.acquire(blocking=False):
@@ -1096,6 +1178,7 @@ def get_photo_status():
     with _photo_lock:
         staged = len(_photo_staging)
         status = _photo_status
+        cam_ip = _cam_ip
     with _state_lock:
         answer_ready = _honest_answer_ready_locked()
     voice_busy = _get_voice_busy()
@@ -1108,10 +1191,16 @@ def get_photo_status():
         else:
             lesson_chunks = _lesson_last_chunks
 
+    # Запись идёт, пока последний принятый чанк моложе окна активности.
+    last_voice_chunk = _get_voice_activity()
+    voice_recording = (last_voice_chunk > 0
+                       and (time.monotonic() - last_voice_chunk) <= VOICE_ACTIVE_WINDOW)
+
     # Новые ключи в конце: старый парсер microReader их просто игнорирует.
     response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready,
                                 "voice_busy": voice_busy, "voice_mode": voice_mode,
-                                "lesson_chunks": lesson_chunks},
+                                "lesson_chunks": lesson_chunks,
+                                "cam_ip": cam_ip, "voice_recording": voice_recording},
                                ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
@@ -1145,8 +1234,8 @@ if __name__ == "__main__":
           f"voice_chunk_max_bytes={VOICE_CHUNK_MAX_BYTES} voice_session_ttl={VOICE_SESSION_TTL} "
           f"photo_frame_max_bytes={PHOTO_FRAME_MAX_BYTES} photos_max_images={PHOTOS_MAX_IMAGES} "
           f"photos_max_total_b64={PHOTOS_MAX_TOTAL_B64} photo_staging_cap={PHOTO_STAGING_CAP} "
-          f"photo_bytes_cap={PHOTO_BYTES_CAP} photo_staging_ttl={PHOTO_STAGING_TTL} "
-          f"max_answer_chars={MAX_ANSWER_CHARS}", flush=True)
+          f"max_answer_chars={MAX_ANSWER_CHARS} voice_active_window={VOICE_ACTIVE_WINDOW}",
+          flush=True)
 
     # ВАЖНО: threaded=True обязателен! Обработка финального чанка занимает
     # 10-25 с (Groq STT + Gemini). Без потоков однопоточный dev-сервер
