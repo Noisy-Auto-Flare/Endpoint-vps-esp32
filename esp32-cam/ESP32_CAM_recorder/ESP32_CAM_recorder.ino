@@ -148,6 +148,12 @@ uint8_t* burstBuf[BURST_MAX_PHOTOS];
 size_t   burstLen[BURST_MAX_PHOTOS];
 int burstCount = 0;
 
+// Последний снятый кадр — копия точных байт JPEG в PSRAM, только для отладки
+// через GET /last_frame. Хранится до замены следующим кадром.
+uint8_t* lastFrameBuf = nullptr;
+size_t   lastFrameLen = 0;
+unsigned long lastFrameMs = 0;
+
 static bool buttonWasPressed = false;
 static unsigned long pressTime = 0;
 static bool longPressHandled = false;
@@ -268,6 +274,32 @@ void setPreviewQuality() {
 }
 
 // ---------------------------------------------------------------------
+// Скопировать кадр в lastFrameBuf (кэш для GET /last_frame).
+// Предыдущая копия освобождается ДО выделения новой — других ссылок на неё
+// нет, поэтому use-after-free невозможен. Ошибка выделения только пишется
+// в Serial и никак не влияет на отправку кадра на бэкенд.
+// ---------------------------------------------------------------------
+void cacheLastFrame(const uint8_t* buf, size_t len) {
+  if (!buf || len == 0) return;
+
+  if (lastFrameBuf) {
+    free(lastFrameBuf);
+    lastFrameBuf = nullptr;
+  }
+  lastFrameLen = 0;
+
+  uint8_t* copy = (uint8_t*) (psramFound() ? ps_malloc(len) : malloc(len));
+  if (!copy) {
+    Serial.println("Не хватило памяти для копии последнего кадра (кэш не обновлён)");
+    return;
+  }
+  memcpy(copy, buf, len);
+  lastFrameBuf = copy;
+  lastFrameLen = len;
+  lastFrameMs = millis();
+}
+
+// ---------------------------------------------------------------------
 // Снять кадр и отправить его на бэкенд-сервер (/api/photo)
 // Возвращает текстовый ответ нейросети (или сообщение об ошибке)
 // ---------------------------------------------------------------------
@@ -283,6 +315,7 @@ String sendPhotoToBackend() {
 
   http.begin(url);
   http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("X-Device-Ip", WiFi.localIP().toString());
   http.addHeader("Content-Type", "application/octet-stream");
   http.setTimeout(30000); // Gemini может думать несколько секунд, даём запас
 
@@ -298,6 +331,8 @@ String sendPhotoToBackend() {
   }
 
   http.end();
+  // Копия точных байт кадра для /last_frame — строго до fb_return.
+  cacheLastFrame(fb->buf, fb->len);
   esp_camera_fb_return(fb);
   return result;
 }
@@ -323,6 +358,7 @@ int sendFrameToBackend(String &body) {
 
   http.begin(url);
   http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("X-Device-Ip", WiFi.localIP().toString());
   http.addHeader("Content-Type", "application/octet-stream");
   http.setTimeout(30000);
 
@@ -331,6 +367,8 @@ int sendFrameToBackend(String &body) {
   Serial.println("sendFrame HTTP " + String(httpCode) + " " + payload);
 
   http.end();
+  // Копия точных байт кадра для /last_frame — строго до fb_return.
+  cacheLastFrame(fb->buf, fb->len);
   esp_camera_fb_return(fb);
   body = payload;
   return httpCode;
@@ -350,6 +388,7 @@ int sendCommitToBackend(String &body) {
 
   http.begin(url);
   http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("X-Device-Ip", WiFi.localIP().toString());
   // Худший случай сервера: Groq 60с + Gemini 60с последовательно (~120с), запас до 150с
   http.setTimeout(150000);
 
@@ -435,6 +474,7 @@ String sendBurstToBackend() {
 
   http.begin(url);
   http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("X-Device-Ip", WiFi.localIP().toString());
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(45000); // несколько картинок сразу - Gemini думает дольше
 
@@ -488,6 +528,8 @@ void handleRoot() {
   html += ".on{background:#c0392b;color:white;} .off{background:#444;color:white;}";
   html += "img{max-width:95%;border-radius:8px;margin-top:15px;}</style></head><body>";
   html += "<h2>ESP32-CAM</h2>";
+  // IP самой платы — чтобы не искать его в Serial или в роутере
+  html += "<p style='font-size:14px;color:#aaa'>IP платы: <b>" + WiFi.localIP().toString() + "</b></p>";
 
   html += "<p>Видео: <b>" + String(recording ? "ИДЁТ (" + recordDir + ", " + String(recordFrameCount) + " кадров)" : "остановлено") + "</b></p>";
   if (recording) {
@@ -528,6 +570,20 @@ void handleRoot() {
   html += "<button class='off' id='burstBtn' onclick='sendBurst()'>Отправить серию в ИИ</button>";
   html += "<p id='burstAnswer' style='text-align:left;white-space:pre-wrap;background:#222;padding:10px;border-radius:8px;min-height:20px;'></p>";
 
+  // Последний кадр — тоже только по кнопке: сервер платы однопоточный,
+  // автозагрузка картинки на каждом открытии страницы занимала бы его зря.
+  html += "<hr style='margin:20px 0;border-color:#444'>";
+  html += "<h3>Последний отправленный кадр</h3>";
+  if (lastFrameBuf && lastFrameLen > 0) {
+    unsigned long lastFrameAgeSec = (millis() - lastFrameMs) / 1000;
+    html += "<p style='font-size:14px;color:#aaa'>В кэше: " + String((unsigned long)lastFrameLen) +
+            " байт, возраст " + String(lastFrameAgeSec) + " с</p>";
+  } else {
+    html += "<p style='font-size:14px;color:#aaa'>Кэш пуст — кадров ещё не отправляли</p>";
+  }
+  html += "<button class='off' onclick='loadLastFrame()'>Показать последний кадр</button>";
+  html += "<div id='lastFrameWrap'></div>";
+
   html += "<script>";
   html += "let previewOn = false;";
   html += "function togglePreview(){";
@@ -566,6 +622,10 @@ void handleRoot() {
   html += "    document.getElementById('burstBtn').disabled = false;";
   html += "  });";
   html += "}";
+  html += "function loadLastFrame(){";
+  html += "  const wrap = document.getElementById('lastFrameWrap');";
+  html += "  wrap.innerHTML = \"<img src='/last_frame?t=\" + Date.now() + \"'>\";"; // ?t= — сброс кэша браузера
+  html += "}";
   html += "</script>";
 
   html += "</body></html>";
@@ -579,9 +639,22 @@ void handleCapture() {
     server.send(500, "text/plain", "Camera capture failed");
     return;
   }
+  // Заодно кладём кадр в кэш последнего кадра (/last_frame).
+  cacheLastFrame(fb->buf, fb->len);
   server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
   server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
   esp_camera_fb_return(fb);
+}
+
+// Отдать кэшированный последний кадр (по кнопке на странице).
+void handleLastFrame() {
+  if (!lastFrameBuf || lastFrameLen == 0) {
+    server.send(404, "text/plain; charset=utf-8", "Нет сохранённого кадра");
+    return;
+  }
+  // no-store: страница сама добавляет ?t=... для сброса кэша браузера
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "image/jpeg", (const char*)lastFrameBuf, lastFrameLen);
 }
 
 // Живой MJPEG-поток для быстрого превью на странице (низкое качество/разрешение).
@@ -698,6 +771,28 @@ void handleStopRecord() {
 }
 
 // ---------------------------------------------------------------------
+// Сообщить бэкенду свой IP: POST /api/device-ip с пустым телом.
+// Одна попытка и короткий таймаут — при неудаче только строка в Serial.
+// ---------------------------------------------------------------------
+void reportIpToBackend() {
+  HTTPClient http;
+  String url = "http://" + String(BACKEND_HOST) + ":" + String(BACKEND_PORT) + "/api/device-ip";
+
+  http.begin(url);
+  http.addHeader("X-Device-Key", BACKEND_DEVICE_KEY);
+  http.addHeader("X-Device-Ip", WiFi.localIP().toString());
+  http.setTimeout(5000); // 5с: setup не должен висеть дольше
+
+  int httpCode = http.POST(String(""));
+  if (httpCode > 0) {
+    Serial.println("IP " + WiFi.localIP().toString() + " отправлен на бэкенд (HTTP " + String(httpCode) + ")");
+  } else {
+    Serial.println("Не удалось отправить IP на бэкенд, HTTP " + String(httpCode));
+  }
+  http.end();
+}
+
+// ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(false);
@@ -739,6 +834,8 @@ void setup() {
     digitalWrite(FLASH_LED_PIN, HIGH); delay(600); digitalWrite(FLASH_LED_PIN, LOW);
     delay(300);
     digitalWrite(FLASH_LED_PIN, HIGH); delay(150); digitalWrite(FLASH_LED_PIN, LOW);
+    // Световой сигнал (LONG + SHORT) не меняем — сообщение об IP идёт после него.
+    reportIpToBackend();
   } else {
     Serial.println("");
     Serial.println("Не удалось подключиться к Wi-Fi. Проверь SSID/пароль.");
@@ -757,6 +854,7 @@ void setup() {
   server.on("/burst_send", handleBurstSend);
   server.on("/toggle_mirror_h", handleToggleMirrorH);
   server.on("/toggle_mirror_v", handleToggleMirrorV);
+  server.on("/last_frame", handleLastFrame);
   server.begin();
   Serial.println("Веб-сервер запущен");
 }
