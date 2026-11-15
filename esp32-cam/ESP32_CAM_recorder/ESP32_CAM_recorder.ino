@@ -69,9 +69,9 @@
 
 // Разрешение/качество для КАЧЕСТВЕННЫХ снимков (запись, таймлапс, отправка в ИИ)
 // FRAMESIZE_ варианты: FRAMESIZE_QVGA(320x240), FRAMESIZE_VGA(640x480),
-// FRAMESIZE_SVGA(800x600), FRAMESIZE_XGA, FRAMESIZE_UXGA(1600x1200) и т.д.
-#define CAPTURE_FRAMESIZE   FRAMESIZE_SVGA
-#define CAPTURE_JPEG_QUALITY 12   // 0(лучшее)..63(худшее); 12 вместо 10: на ~20-30% меньше байт кадра, для печатных заданий качества хватает
+// FRAMESIZE_SVGA(800x600), FRAMESIZE_XGA(1024x768), FRAMESIZE_UXGA(1600x1200) и т.д.
+#define CAPTURE_FRAMESIZE   FRAMESIZE_XGA
+#define CAPTURE_JPEG_QUALITY 10   // 0(лучшее)..63(худшее); XGA+q10: больше пикселей для чтения заданий, кадр ~60-90 КБ
 
 // Разрешение/качество ТОЛЬКО для быстрого живого превью в браузере (/stream)
 // Специально маленькое и похуже качеством — чтобы обновлялось быстро
