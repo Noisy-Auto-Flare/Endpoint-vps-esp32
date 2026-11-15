@@ -3,7 +3,7 @@
 // включается вручную кнопкой и гасится на любом выходе.
 #define ANS_MAX 40
 
-String ansFiles[ANS_MAX];   // имена answer_*.txt без ведущего "/" (старые -> новые)
+String ansFiles[ANS_MAX];   // имена answer_*.txt без ведущего "/" (новые -> старые)
 int ansNums[ANS_MAX];       // их числовые суффиксы
 int ansCount = 0;
 bool ansExitToMain = false;  // Меню 3 просит Меню 2 сразу выйти в главное
@@ -19,7 +19,7 @@ String monNotice = "";          // строка 4: ошибка/подсказк
 String voiceMode = "qa";     // режим сервера: "qa" (вопрос-ответ) | "lesson" (урок)
 bool voiceModeKnown = false;  // true только после подтверждения сервером (GET/POST)
 
-// Список /answer_*.txt, сортировка по номеру: СТАРЫЕ -> НОВЫЕ (новейший последний).
+// Список /answer_*.txt, сортировка по номеру: НОВЫЕ -> СТАРЫЕ (новейший первым).
 void ansRebuildList() {
   ansCount = 0;
   Dir root = LittleFS.openDir("/");
@@ -31,17 +31,13 @@ void ansRebuildList() {
       int num = nm.substring(8, nm.length() - 4).toInt();
       if (num <= 0) continue;
       if (ansCount >= ANS_MAX) {
-        // Массив полон: держим 40 НОВЕЙШИХ — вытесняем самый старый (первый),
+        // Массив полон: держим 40 НОВЕЙШИХ — вытесняем самый старый (последний),
         // только если пришедший новее. Иначе файл пропускаем.
-        if (num <= ansNums[0]) continue;
-        for (int i = 1; i < ansCount; i++) {  // первый (самый старый) выбывает
-          ansNums[i - 1] = ansNums[i];
-          ansFiles[i - 1] = ansFiles[i];
-        }
+        if (num <= ansNums[ansCount - 1]) continue;
         ansCount--;
       }
       int pos = ansCount;
-      while (pos > 0 && ansNums[pos - 1] > num) {  // по возрастанию: новые в конец
+      while (pos > 0 && ansNums[pos - 1] < num) {  // по убыванию: новые в начало
         ansNums[pos] = ansNums[pos - 1];
         ansFiles[pos] = ansFiles[pos - 1];
         pos--;
@@ -281,7 +277,7 @@ void enterMonitorMenu() {
     }
 
     // Опрос раз в 2 с, только пока ВКЛ. Ответ готов — сразу забираем тихо
-    // и выходим: файл уже сохранён, Меню 2 покажет его в конце списка.
+    // и выходим: файл уже сохранён, Меню 2 покажет его первым в списке.
     if (monitoring && millis() - lastPoll >= 2000) {
       lastPoll = millis();
       if (!ansPollMonitor()) {
