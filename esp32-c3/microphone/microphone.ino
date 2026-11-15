@@ -26,9 +26,10 @@
  * Пины:
  *   GPIO4  — OUT микрофона MAX4466 (ADC1_CH4)
  *   GPIO9  — кнопка (BOOT): старт/стоп записи
- *   GPIO8  — встроенный синий LED: горит = запись;
+ *   GPIO8  — встроенный синий LED: один длинный миг = старт записи
+ *            (постоянно НЕ горит: LED_SOLID_WHILE_RECORDING = false);
  *            2 мига = ошибка отправки; 3 мига = сессия успешно завершена;
- *            5 мигов = фатальная ошибка (SPIFFS/Wi-Fi)
+ *            5 миганий = фатальная ошибка (SPIFFS/Wi-Fi)
  */
 
 #include <Arduino.h>
@@ -72,6 +73,10 @@ constexpr uint32_t MAX_CHUNKS = MAX_SECONDS / CHUNK_SECONDS;   // 2ч / 5с = 14
 // Очередь на отправку ограничена RAM/SPIFFS (8 * 160 КБ ≈ 1.3 МБ), а не
 // длиной сессии: файл чанка удаляется сразу после успешной отправки.
 constexpr uint32_t UPLOAD_QUEUE_LEN = 8;
+// Повторы отправки: один сбой на школьном хотспоте не должен терять чанк
+// (дыра в аудио остаётся навсегда). Повторяем только при ошибке.
+constexpr int      UPLOAD_RETRIES         = 3;
+constexpr uint32_t UPLOAD_RETRY_PAUSE_MS  = 2000;
 // Постоянное свечение LED во время записи. По умолчанию ВЫКЛ: урок идёт
 // 40-90 минут, горящий светодиод демаскирует устройство перед учителем.
 constexpr bool LED_SOLID_WHILE_RECORDING = false;
@@ -549,12 +554,33 @@ void loop() {
 
   UploadJob job;
   if (xQueueReceive(uploadQueue, &job, pdMS_TO_TICKS(100)) == pdTRUE) {
-    const bool ok = sendJob(job);
+    bool ok = false;
+    for (int attempt = 1; attempt <= UPLOAD_RETRIES; attempt++) {
+      ok = sendJob(job);
+      if (ok) break;
+      if (attempt < UPLOAD_RETRIES) {
+        Serial.printf("Повтор отправки чанка %d: попытка %d из %d",
+                      job.index, attempt + 1, UPLOAD_RETRIES);
+        Serial.printf(" через %lu мс\n", (unsigned long)UPLOAD_RETRY_PAUSE_MS);
+        delay(UPLOAD_RETRY_PAUSE_MS);
+      }
+    }
 
     if (ok && job.file[0] != '\0') {
       xSemaphoreTake(spiffsMutex, portMAX_DELAY);
       SPIFFS.remove(job.file);
       xSemaphoreGive(spiffsMutex);
+    }
+
+    if (!ok) {
+      if (job.file[0] != '\0') {
+        Serial.printf("Чанк %d НЕ отправлен после %d попыток — файл %s",
+                      job.index, UPLOAD_RETRIES, job.file);
+        Serial.println(" оставлен в SPIFFS");
+      } else {
+        Serial.printf("Финальный маркер не отправлен после %d попыток\n",
+                      UPLOAD_RETRIES);
+      }
     }
 
     if (job.finalChunk) {
