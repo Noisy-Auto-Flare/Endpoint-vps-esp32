@@ -3,17 +3,23 @@
 // включается вручную кнопкой и гасится на любом выходе.
 #define ANS_MAX 40
 
-String ansFiles[ANS_MAX];   // имена answer_*.txt без ведущего "/" (новые -> старые)
+String ansFiles[ANS_MAX];   // имена answer_*.txt без ведущего "/" (старые -> новые)
 int ansNums[ANS_MAX];       // их числовые суффиксы
 int ansCount = 0;
 bool ansExitToMain = false;  // Меню 3 просит Меню 2 сразу выйти в главное
 
-String monLines[3];          // живые строки состояния Меню 3
-int monLineCount = 0;
+// Живое состояние Меню 3: фиксированные 6 строк, без прокрутки.
+int monStaged = 0;              // строка 2: "Кадров: N"
+bool monAnswerReady = false;    // строка 4: "Ответ получен"
+bool monVoiceBusy = false;      // строка 4: "Голос: думаю..."
+int monLessonChunks = 0;        // строка 3: "Пишу: N" / "Записано: N"
+String monCamIp = "";           // строка 5: "CAM <ip>"
+bool monVoiceRecording = false; // строка 3: идёт запись
+String monNotice = "";          // строка 4: ошибка/подсказка вместо статуса
 String voiceMode = "qa";     // режим сервера: "qa" (вопрос-ответ) | "lesson" (урок)
 bool voiceModeKnown = false;  // true только после подтверждения сервером (GET/POST)
 
-// Список /answer_*.txt, сортировка по номеру: НОВЫЕ -> СТАРЫЕ.
+// Список /answer_*.txt, сортировка по номеру: СТАРЫЕ -> НОВЫЕ (новейший последний).
 void ansRebuildList() {
   ansCount = 0;
   Dir root = LittleFS.openDir("/");
@@ -25,13 +31,17 @@ void ansRebuildList() {
       int num = nm.substring(8, nm.length() - 4).toInt();
       if (num <= 0) continue;
       if (ansCount >= ANS_MAX) {
-        // Массив полон: держим 40 НОВЕЙШИХ — вытесняем самый старый,
+        // Массив полон: держим 40 НОВЕЙШИХ — вытесняем самый старый (первый),
         // только если пришедший новее. Иначе файл пропускаем.
-        if (num <= ansNums[ansCount - 1]) continue;
+        if (num <= ansNums[0]) continue;
+        for (int i = 1; i < ansCount; i++) {  // первый (самый старый) выбывает
+          ansNums[i - 1] = ansNums[i];
+          ansFiles[i - 1] = ansFiles[i];
+        }
         ansCount--;
       }
       int pos = ansCount;
-      while (pos > 0 && ansNums[pos - 1] < num) {
+      while (pos > 0 && ansNums[pos - 1] > num) {  // по возрастанию: новые в конец
         ansNums[pos] = ansNums[pos - 1];
         ansFiles[pos] = ansFiles[pos - 1];
         pos--;
@@ -69,17 +79,15 @@ void ansDrawList(int ansCursor) {
   oled.update();
 }
 
-/* ============ Меню 3: мониторинг (как главное, всё вручную) ============== */
+/* ============ Меню 3: мониторинг, фиксированные 6 строк ================ */
 void ansDrawMonitor(int ansCursor, bool monitoring) {
   oled.clear();
   oled.home();
   oled.line(0, 10, 127, 10);
   oled.print(F("МОНИТОРИНГ"));
 
-  int totalRows = 2 + monLineCount;  // 0 — тумблер, 1 — режим, далее статус
-  int sidx = (ansCursor < 6 ? 0 : ansCursor - 5);
-  for (int r = sidx; r < sidx + 6 && r < totalRows; r++) {
-    oled.setCursor(6, 2 + (r - sidx));
+  for (int r = 0; r < 6; r++) {  // ровно 6 строк — прокрутка не нужна
+    oled.setCursor(6, 2 + r);
     if (r == 0) {
       if (monitoring) oled.print(F("Мониторинг: ВКЛ"));
       else oled.print(F("Мониторинг: ВЫКЛ"));
@@ -87,13 +95,37 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
       if (!voiceModeKnown) oled.print(F("Режим: ...?"));
       else if (voiceMode == "lesson") oled.print(F("Режим: Урок"));
       else oled.print(F("Режим: Вопросы"));
+    } else if (r == 2) {
+      oled.print(F("Кадров: "));
+      oled.print(monStaged);
+    } else if (r == 3) {
+      bool lesson = (voiceMode == "lesson");
+      if (monVoiceRecording) {
+        if (lesson) {
+          oled.print(F("Пишу: "));
+          oled.print(monLessonChunks);
+        } else oled.print(F("Идёт запись"));
+      } else {
+        if (lesson) {
+          oled.print(F("Записано: "));
+          oled.print(monLessonChunks);
+        } else oled.print(F("Запись: нет"));
+      }
+    } else if (r == 4) {
+      if (monNotice.length()) oled.print(monNotice);
+      else if (monAnswerReady) oled.print(F("Ответ получен"));
+      else if (monVoiceBusy) oled.print(F("Голос: думаю..."));
+      else oled.print(F("-"));
     } else {
-      oled.print(monLines[r - 2]);
+      if (monCamIp.length()) {
+        oled.print(F("CAM "));
+        oled.print(monCamIp);
+      } else oled.print(F("CAM: -"));
     }
     yield();
   }
 
-  int cp = constrain(ansCursor - sidx, 0, 5) + 2;
+  int cp = constrain(ansCursor, 0, 5) + 2;
   oled.setCursor(0, cp);
   oled.print(">");
 
@@ -103,42 +135,34 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
 }
 
 // Опрос сервера для Меню 3: GET /api/photo-status + GET /api/voice-mode.
-// true — статус получен (monLines заполнены), false — ошибка сервера.
-bool ansPollMonitor(bool &monReady) {
-  int staged = 0;
+// true — статус получен (строки 2..5 свежие), false — ошибка сервера.
+bool ansPollMonitor() {
   String photoStatus = "idle";
-  bool answerReady = false;
-  bool voiceBusy = false;
-  int lessonChunks = 0;
-  if (!fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, lessonChunks)) {
+  if (!fetchPhotoStatus(monStaged, photoStatus, monAnswerReady, monVoiceBusy, monLessonChunks, monCamIp, monVoiceRecording)) {
+    monAnswerReady = false;
+    monVoiceBusy = false;
     return false;
   }
   if (fetchVoiceMode(voiceMode)) voiceModeKnown = true;  // при ошибке — прежний режим и прежний флаг
-  monReady = answerReady;
-  monLineCount = 0;
-  monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
-  monLines[monLineCount++] = "кадров на сервере: " + String(staged);
-  if (voiceMode == "lesson" && monLineCount < 3) {
-    monLines[monLineCount].reserve(32);
-    monLines[monLineCount++] = "чанков урока: " + String(lessonChunks);
-  }
-  if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
-  else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
   return true;
 }
 
 void enterMonitorMenu() {
   ansExitToMain = false;
   bool monitoring = false;
-  bool monReady = false;
-  voiceModeKnown = false;  // вход в меню: режим подтверждается только свежим опросом
   int ansCursor = 0;
   unsigned long enterTime = millis();
   unsigned long lastPoll = 0;
   uiTimer = millis();
 
-  monLineCount = 1;
-  monLines[0] = "выключено";
+  voiceModeKnown = false;  // вход в меню: режим подтверждается только свежим опросом
+  monStaged = 0;
+  monAnswerReady = false;
+  monVoiceBusy = false;
+  monLessonChunks = 0;
+  monCamIp = "";
+  monVoiceRecording = false;
+  monNotice = "";
   ansDrawMonitor(ansCursor, monitoring);
 
   while (true) {
@@ -159,14 +183,13 @@ void enterMonitorMenu() {
       return;
     }
 
-    int totalRows = 2 + monLineCount;  // 0 — тумблер, 1 — режим, далее статус
     if (up.click()) {
       uiTimer = millis();
-      ansCursor = constrain(ansCursor - 1, 0, totalRows - 1);
+      ansCursor = constrain(ansCursor - 1, 0, 5);  // курсор только по 6 строкам
       ansDrawMonitor(ansCursor, monitoring);
     } else if (down.click()) {
       uiTimer = millis();
-      ansCursor = constrain(ansCursor + 1, 0, totalRows - 1);
+      ansCursor = constrain(ansCursor + 1, 0, 5);
       ansDrawMonitor(ansCursor, monitoring);
     }
 
@@ -175,16 +198,11 @@ void enterMonitorMenu() {
       if (ansCursor == 1) {
         // Строка режима: OK переключает режим сервера (qa <-> lesson)
         if (!monitoring) {
-          monLineCount = 1;
-          monLines[0] = "включи мониторинг";
-          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          monNotice = "включи мониторинг";
           ansDrawMonitor(ansCursor, monitoring);
         } else if (!voiceModeKnown) {
           // Режим не подтверждён сервером: переключать нечего, ждём удачный опрос
-          monReady = false;
-          monLineCount = 1;
-          monLines[0] = "нет данных о режиме";
-          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          monNotice = "нет данных о режиме";
           ansDrawMonitor(ansCursor, monitoring);
         } else {
           String want = (voiceMode == "lesson") ? "qa" : "lesson";
@@ -196,59 +214,18 @@ void enterMonitorMenu() {
           if (postVoiceMode(want, confirmed)) {
             voiceMode = confirmed;  // доверяем только ответу сервера
             voiceModeKnown = true;
-            if (!ansPollMonitor(monReady)) {
-              monReady = false;
-              monLineCount = 1;
-              monLines[0] = "ошибка сервера";
-            }
+            monNotice = ansPollMonitor() ? "" : "Ошибка сервера";
           } else {
-            monReady = false;
-            monLineCount = 1;
-            monLines[0] = "ошибка смены режима";
+            monNotice = "ошибка смены режима";
           }
           lastPoll = millis();
-          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
           ansDrawMonitor(ansCursor, monitoring);
         }
-      } else if (monitoring && monReady) {
-        // Ответ готов: OK забирает и сохраняет, мониторинг остаётся ВКЛ
-        ansRebuildList();
-        int oldNums[ANS_MAX];
-        int oldCount = ansCount;
-        for (int i = 0; i < ansCount; i++) oldNums[i] = ansNums[i];
-        bool got = fetchAndSaveAnswer();
-        if (got) {
-          ansRebuildList();
-          String newFn = "";
-          for (int i = 0; i < ansCount; i++) {
-            bool found = false;
-            for (int j = 0; j < oldCount; j++) {
-              if (ansNums[i] == oldNums[j]) { found = true; break; }
-            }
-            if (!found) { newFn = "/" + ansFiles[i]; break; }
-          }
-          if (newFn == "") newFn = ansCount > 0 ? "/" + ansFiles[0] : "/answer_N.txt";
-          monReady = false;
-          monLineCount = 0;
-          monLines[monLineCount++] = "сохранено:";
-          if (monLineCount < 3) monLines[monLineCount++] = newFn;
-        } else {
-          // Не забрали: обновляем статус, ответ не предлагаем повторно
-          monReady = false;
-          if (!ansPollMonitor(monReady)) {
-            monLineCount = 1;
-            monLines[0] = "ошибка сервера";
-          }
-        }
-        ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
-        lastPoll = millis();
-        ansDrawMonitor(ansCursor, monitoring);
       } else if (ansCursor == 0) {
-        // Кнопка: вкл/выкл мониторинга
+        // Строка тумблера: вкл/выкл мониторинга
         if (!monitoring) {
           if (strlen(sets.backendHost) == 0 || sets.backendPort == 0 || strlen(sets.deviceKey) == 0) {
-            monLineCount = 1;
-            monLines[0] = "настрой сервер";
+            monNotice = "настрой сервер";
             ansDrawMonitor(ansCursor, monitoring);
           } else {
             oled.clear(); oled.home();
@@ -267,45 +244,48 @@ void enterMonitorMenu() {
             }
             if (WiFi.status() != WL_CONNECTED) {
               WiFi.mode(WIFI_OFF);
-              monLineCount = 1;
-              monLines[0] = "ошибка wifi";
+              monNotice = "ошибка wifi";
               ansDrawMonitor(ansCursor, monitoring);
             } else {
               monitoring = true;
-              if (!ansPollMonitor(monReady)) {
-                monReady = false;
-                monLineCount = 1;
-                monLines[0] = "ошибка сервера";
-              }
+              monNotice = ansPollMonitor() ? "" : "Ошибка сервера";
               lastPoll = millis();
-              ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
               ansDrawMonitor(ansCursor, monitoring);
             }
           }
         } else {
           monitoring = false;
-          monReady = false;
           voiceModeKnown = false;  // знание устарело: сервер мог перезапуститься
           WiFi.mode(WIFI_OFF);
-          monLineCount = 1;
-          monLines[0] = "выключено";
-          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          monStaged = 0;
+          monAnswerReady = false;
+          monVoiceBusy = false;
+          monLessonChunks = 0;
+          monCamIp = "";
+          monVoiceRecording = false;
+          monNotice = "";
           ansDrawMonitor(ansCursor, monitoring);
         }
       }
-      // OK на строках статуса (ответ не готов): ничего не делаем
+      // OK на строках 2..5: ничего не делаем
     }
 
-    // Опрос раз в 2 с, только пока ВКЛ (трафик мизерный — реже дёргаем сеть,
-    // вдвое меньше String-чёрна и мусора в Serial, UX тот же — ответ забирается вручную по OK)
+    // Опрос раз в 2 с, только пока ВКЛ. Ответ готов — сразу забираем тихо
+    // и выходим: файл уже сохранён, Меню 2 покажет его в конце списка.
     if (monitoring && millis() - lastPoll >= 2000) {
       lastPoll = millis();
-      if (!ansPollMonitor(monReady)) {
-        monReady = false;
-        monLineCount = 1;
-        monLines[0] = "ошибка сервера";
+      if (!ansPollMonitor()) {
+        monNotice = "Ошибка сервера";
+      } else {
+        monNotice = "";
+        if (monAnswerReady) {
+          String savedName = "";
+          if (fetchLatestAnswerQuiet(savedName)) {
+            break;  // общий хвост гасит WiFi, Меню 2 перестроит список
+          }
+          monNotice = "Ошибка сервера";  // не забрали — мониторинг остаётся ВКЛ
+        }
       }
-      ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
       ansDrawMonitor(ansCursor, monitoring);
     }
 

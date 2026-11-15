@@ -1,10 +1,15 @@
-// fetchAndSaveAnswer: одиночный опрос GET /api/latest.
-// Требует уже подключённого WiFi. Возвращает true, если ответ
-// получен и сохранён как /answer_N.txt. Прогресс — на OLED.
-bool fetchAndSaveAnswer() {
-    oled.clear(); oled.home();
-    oled.println("Запрос к серверу...");
-    oled.update();
+// Результаты GET /api/latest (int: тип не зависит от порядка файлов в скетче).
+#define LATEST_OK          0  // ответ сохранён (savedName = "/answer_N.txt")
+#define LATEST_NONE        1  // ready:false — новых ответов нет
+#define LATEST_NO_TEXT     2  // ready:true, но text не распарсился (без экрана)
+#define LATEST_HTTP_ERROR  3  // HTTP != 200
+#define LATEST_DISK_ERROR  4  // файл не открылся / запись оборвалась
+
+// Ядро: GET /api/latest + парсинг + сохранение как /answer_N.txt.
+// Без экрана и пауз: экран рисует вызывающий код.
+// savedName — путь сохранённого файла ("" при неудаче), httpCode — код ответа.
+int fetchLatestAnswerCore(String &savedName, int &httpCode) {
+    savedName = "";
 
     WiFiClient client;
     HTTPClient http;
@@ -16,15 +21,18 @@ bool fetchAndSaveAnswer() {
     http.addHeader("X-Device-Key", sets.deviceKey);
     http.setTimeout(10000);
 
-    int httpCode = http.GET();
-    bool success = false;
+    httpCode = http.GET();
+    int result = LATEST_HTTP_ERROR;
 
     if (httpCode == 200) {
         String response = http.getString();
         // Парсинг JSON вручную (лёгкий ответ {"ready":true,"text":"...","source":"...","created_at":...})
         bool ready = response.indexOf("\"ready\":true") >= 0;
 
-        if (ready) {
+        if (!ready) {
+            result = LATEST_NONE;
+        } else {
+            result = LATEST_NO_TEXT;
             // Извлекаем text между "text":" и ","source"
             int textStart = response.indexOf("\"text\":\"");
             if (textStart >= 0) {
@@ -58,50 +66,77 @@ bool fetchAndSaveAnswer() {
                         size_t written = f.print(answerText);
                         f.close();
                         if (written != answerText.length()) {
-                            // Диск переполнен посреди записи: показываем ошибку,
-                            // частичный файл остаётся (не блокирует свой N).
-                            oled.clear(); oled.home();
-                            oled.println("Ошибка записи:");
-                            oled.println("нет места");
-                            oled.println("на диске");
-                            oled.update(); delay(2000);
+                            // Диск переполнен посреди записи: частичный файл остаётся
+                            // (не блокирует свой N) — ошибку покажет вызывающий код.
+                            result = LATEST_DISK_ERROR;
                         } else {
-                        oled.clear(); oled.home();
-                        oled.println("Ответ получен!");
-                        oled.println("");
-                        oled.print("Сохранено как:");
-                        oled.setCursor(0, 4);
-                        oled.print(fn);
-                        oled.update();
-                        success = true;
-                        delay(3000);
+                            savedName = fn;
+                            result = LATEST_OK;
                         }
                     } else {
-                        // Файл не открылся (диск полон): молча не уходим.
-                        oled.clear(); oled.home();
-                        oled.println("Ошибка записи:");
-                        oled.println("нет места");
-                        oled.println("на диске");
-                        oled.update(); delay(2000);
+                        // Файл не открылся (диск полон)
+                        result = LATEST_DISK_ERROR;
                     }
                 }
             }
-        } else {
-            oled.clear(); oled.home();
-            oled.println("Нет новых");
-            oled.println("ответов на");
-            oled.println("сервере");
-            oled.update(); delay(2000);
         }
-    } else {
+    }
+
+    http.end();
+    return result;
+}
+
+// Тихий путь для Меню 3: тот же GET + парсинг + сохранение, но без экрана
+// и без delay(). true — ответ сохранён, savedName = "/answer_N.txt".
+bool fetchLatestAnswerQuiet(String &savedName) {
+    int httpCode = 0;
+    return fetchLatestAnswerCore(savedName, httpCode) == LATEST_OK;
+}
+
+// fetchAndSaveAnswer: одиночный опрос GET /api/latest с экранным прогрессом.
+// Требует уже подключённого WiFi. Возвращает true, если ответ
+// получен и сохранён как /answer_N.txt.
+bool fetchAndSaveAnswer() {
+    oled.clear(); oled.home();
+    oled.println("Запрос к серверу...");
+    oled.update();
+
+    String savedName = "";
+    int httpCode = 0;
+    int result = fetchLatestAnswerCore(savedName, httpCode);
+
+    if (result == LATEST_OK) {
+        oled.clear(); oled.home();
+        oled.println("Ответ получен!");
+        oled.println("");
+        oled.print("Сохранено как:");
+        oled.setCursor(0, 4);
+        oled.print(savedName);
+        oled.update();
+        delay(3000);
+        return true;
+    }
+
+    if (result == LATEST_DISK_ERROR) {
+        oled.clear(); oled.home();
+        oled.println("Ошибка записи:");
+        oled.println("нет места");
+        oled.println("на диске");
+        oled.update(); delay(2000);
+    } else if (result == LATEST_NONE) {
+        oled.clear(); oled.home();
+        oled.println("Нет новых");
+        oled.println("ответов на");
+        oled.println("сервере");
+        oled.update(); delay(2000);
+    } else if (result == LATEST_HTTP_ERROR) {
         oled.clear(); oled.home();
         oled.println("Ошибка сервера:");
         oled.printf("HTTP %d", httpCode);
         oled.update(); delay(2000);
     }
-
-    http.end();
-    return success;
+    // LATEST_NO_TEXT: молча уходим (как раньше — без экрана)
+    return false;
 }
 
 // LEGACY: single-shot опрос /api/latest без меню. Заменено на
@@ -165,9 +200,10 @@ String photoStatusRu(const String& s) {
 }
 
 // Опрос GET /api/photo-status. Возвращает true при HTTP 200.
-// На выходе: staged, photoStatus, answerReady, voiceBusy, lessonChunks
-// (missing key = false / 0 — старый сервер не ломает Меню 3).
-bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy, int &lessonChunks) {
+// На выходе: staged, photoStatus, answerReady, voiceBusy, lessonChunks,
+// camIp, voiceRecording (нет ключа = "" / false / 0 — старый сервер не ломает Меню 3).
+// Молча: ошибку рисует вызывающий код (Меню 3 — строка 4), без окон и пауз.
+bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy, int &lessonChunks, String &camIp, bool &voiceRecording) {
     WiFiClient client;
     HTTPClient http;
     String url;
@@ -208,29 +244,40 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool 
         if (pLc >= 0) {
             lessonChunks = response.substring(pLc + 16).toInt();
         }
+        // cam_ip опционален: нет ключа = "" (прошивка без CAM / старый сервер).
+        camIp = "";
+        int pCam = response.indexOf("\"cam_ip\":\"");
+        if (pCam >= 0) {
+            int vStart = pCam + 10; // длина "cam_ip":"
+            int vEnd = response.indexOf("\"", vStart);
+            if (vEnd > vStart) {
+                camIp = response.substring(vStart, vEnd);
+            }
+        }
+        // voice_recording опционален: нет ключа = false.
+        voiceRecording = response.indexOf("\"voice_recording\":true") >= 0;
         ok = true;
-    } else {
-        oled.clear(); oled.home();
-        oled.println("Ошибка сервера:");
-        oled.printf("HTTP %d", httpCode);
-        oled.update(); delay(2000);
     }
 
     http.end();
     return ok;
 }
 
-// Совместимость со старым меню статуса (без lesson_chunks).
+// Совместимость со старым меню статуса (без cam_ip / voice_recording).
 bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy) {
     int dummyChunks = 0;
-    return fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, dummyChunks);
+    String dummyCamIp = "";
+    bool dummyRecording = false;
+    return fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, dummyChunks, dummyCamIp, dummyRecording);
 }
 
 // Совместимость со старым меню статуса (без voice_busy / lesson_chunks).
 bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
     bool dummyBusy = false;
     int dummyChunks = 0;
-    return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy, dummyChunks);
+    String dummyCamIp = "";
+    bool dummyRecording = false;
+    return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy, dummyChunks, dummyCamIp, dummyRecording);
 }
 
 // GET /api/voice-mode -> mode ("qa"/"lesson").
