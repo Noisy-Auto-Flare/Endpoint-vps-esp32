@@ -46,7 +46,9 @@ constexpr int      LED_PIN       = 8;      // SuperMini: светится при
 
 constexpr uint32_t SAMPLE_RATE   = 16000;  // Гц — держится железом (DMA)
 constexpr uint32_t CHUNK_SECONDS = 5;      // длительность одного чанка
-constexpr uint32_t MAX_SECONDS   = 30;     // жёсткий лимит всей записи
+// Лимит ОДНОЙ записи: урок с запасом. В режиме урока сервер копит одну
+// сессию в один WAV, поэтому нажал в начале урока — отпустил в конце.
+constexpr uint32_t MAX_SECONDS   = 7200;   // 2 часа
 constexpr int16_t  ADC_CENTER    = 2048;   // середина шкалы 12-бит ADC
 // Усиление: если Whisper слышит глухо — увеличь (16-24); если хрипы — уменьши.
 constexpr int32_t  MIC_GAIN      = 12;
@@ -62,11 +64,17 @@ constexpr size_t FRAME_BYTES   = FRAME_SAMPLES * SOC_ADC_DIGI_RESULT_BYTES;
 
 constexpr size_t RING_SIZE_BYTES = 16384;              // ≈0.5 с звука запаса
 
-// Имена файлов УНИКАЛЬНЫ для каждого чанка сессии (/c0.wav ... /c5.wav):
+// Имена файлов УНИКАЛЬНЫ для каждого чанка сессии (/c0.wav ... /cN.wav):
 // при медленном Wi-Fi загрузка чанка может идти дольше записи следующего,
-// и переиспользование двух имён (ping-pong) приводило к удалению файла,
-// открытого загрузчиком -> порча SPIFFS. Максимум чанков = 30с/5с = 6.
-constexpr uint32_t MAX_CHUNKS = MAX_SECONDS / CHUNK_SECONDS;
+// и переиспользование имён (ping-pong) приводило к удалению файла,
+// открытого загрузчиком -> порча SPIFFS.
+constexpr uint32_t MAX_CHUNKS = MAX_SECONDS / CHUNK_SECONDS;   // 2ч / 5с = 1440
+// Очередь на отправку ограничена RAM/SPIFFS (8 * 160 КБ ≈ 1.3 МБ), а не
+// длиной сессии: файл чанка удаляется сразу после успешной отправки.
+constexpr uint32_t UPLOAD_QUEUE_LEN = 8;
+// Постоянное свечение LED во время записи. По умолчанию ВЫКЛ: урок идёт
+// 40-90 минут, горящий светодиод демаскирует устройство перед учителем.
+constexpr bool LED_SOLID_WHILE_RECORDING = false;
 constexpr const char* LEGACY_CHUNK_FILES[] = { "/chk_a.wav", "/chk_b.wav" };
 
 // ============================ СОСТОЯНИЕ ===================================
@@ -213,13 +221,20 @@ static inline void adcStopCapture() {
 // Один производитель и один потребитель — оба в samplerTask, без блокировок.
 static uint8_t ring[RING_SIZE_BYTES];
 static size_t  ringHead = 0, ringTail = 0, ringUsed = 0;
+static uint32_t ringOverflows = 0;   // байты, потерянные при переполнении кольца
 
-inline void ringPush(const uint8_t* data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
+// Возвращает сколько байт реально принято (переполнение — дропаем НОВОЕ,
+// а не затираем уже записанное: иначе тихо портится весь чанк).
+inline size_t ringPush(const uint8_t* data, size_t len) {
+  const size_t freeBytes = (ringUsed >= RING_SIZE_BYTES) ? 0 : (RING_SIZE_BYTES - ringUsed);
+  const size_t take = (len <= freeBytes) ? len : freeBytes;
+  for (size_t i = 0; i < take; i++) {
     ring[ringHead] = data[i];
     ringHead = (ringHead + 1) % RING_SIZE_BYTES;
   }
-  ringUsed += len;
+  ringUsed += take;
+  if (take < len) ringOverflows += (len - take);
+  return take;
 }
 
 inline size_t ringPop(uint8_t* dst, size_t maxLen) {
@@ -263,6 +278,13 @@ void samplerTask(void*) {
     xQueueReceive(cmdQueue, &cmd, portMAX_DELAY);
     if (cmd != BtnCmd::START) continue;
 
+    // Страховка от гонки имён: пока чанки прошлой записи не ушли — новую не начинаем.
+    if (uxQueueMessagesWaiting(uploadQueue) > 0) {
+      Serial.println("Подожди: догружаются чанки прошлой записи, старт отклонён");
+      blinkLed(2, 100, 100);
+      continue;
+    }
+
     // --- Старт сессии (все переменные локальны — гонок с новой сессией нет) ---
     String sessionId = String((unsigned long)(esp_timer_get_time() / 1000000ULL)) +
                        String(random(1000, 9999));
@@ -276,7 +298,11 @@ void samplerTask(void*) {
     adc_continuous_read(adcHandle, frame, sizeof(frame), &got, pdMS_TO_TICKS(500));
 
     recordingActive = true;
-    ledOn();
+    if (LED_SOLID_WHILE_RECORDING) {
+      ledOn();
+    } else {
+      blinkLed(1, 300, 0);   // один длинный миг = запись началась (LED не горит постоянно)
+    }
     Serial.println(">>> Запись НАЧАЛАСЬ, сессия: " + sessionId);
 
     bool stopping = false;
@@ -338,6 +364,12 @@ void samplerTask(void*) {
       // --- Финализируем чанк и ставим в очередь отправки ---
       finalizeChunkFile(f, chunkSamples * 2);
 
+      if (ringOverflows > 0) {   // не молчим о потерянных байтах аудио
+        Serial.printf("Внимание: кольцо переполнено, потеряно %lu байт в чанке %d\n",
+                      (unsigned long)ringOverflows, chunkIndex);
+        ringOverflows = 0;
+      }
+
       const bool nothingRecorded = (chunkSamples == 0);
 
       // Случай "стоп в момент ровно между чанками, данных нет вообще":
@@ -365,7 +397,7 @@ void samplerTask(void*) {
 
     adcStopCapture();
     recordingActive = false;
-    ledOff();
+    if (LED_SOLID_WHILE_RECORDING) ledOff();
     Serial.println(">>> Запись завершена");
 
 sessionEnd:;
@@ -558,10 +590,18 @@ void setup() {
   for (const char* p : LEGACY_CHUNK_FILES) {
     if (SPIFFS.exists(p)) SPIFFS.remove(p);   // мусор старых версий
   }
-  for (uint32_t i = 0; i < MAX_CHUNKS; i++) { // недоотправленные чанки прошлой сессии
-    char p[12];
-    snprintf(p, sizeof(p), "/c%u.wav", (unsigned)i);
-    if (SPIFFS.exists(p)) SPIFFS.remove(p);
+  // Недоотправленные чанки прошлой сессии: обходим каталог один раз,
+  // а не перебираем 1440 имён (иначе заметная задержка на старте).
+  File root = SPIFFS.open("/");
+  if (root) {
+    File f = root.openNextFile();
+    while (f) {
+      String n = f.name();
+      if (!n.startsWith("/")) n = "/" + n;
+      if (n.startsWith("/c") && n.endsWith(".wav")) SPIFFS.remove(n);
+      f = root.openNextFile();
+    }
+    root.close();
   }
 
   WiFi.mode(WIFI_STA);
@@ -584,7 +624,7 @@ void setup() {
   adcInit();   // драйвер создаётся один раз; старт/стоп захвата — по сессии
 
   cmdQueue    = xQueueCreate(4, sizeof(BtnCmd));
-  uploadQueue = xQueueCreate(MAX_CHUNKS + 2, sizeof(UploadJob));   // чанки + маркер
+  uploadQueue = xQueueCreate(UPLOAD_QUEUE_LEN, sizeof(UploadJob));   // ограниченная очередь
   spiffsMutex = xSemaphoreCreateMutex();
 
   // Приоритет выше loopTask; WiFi/lwIP всё ещё выше внутри IDF.
