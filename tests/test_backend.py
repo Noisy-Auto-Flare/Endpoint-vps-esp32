@@ -1072,6 +1072,62 @@ class LessonModeTest(unittest.TestCase):
         raw = client.get("/api/photo-status", headers=HEADERS).get_data(as_text=True)
         self.assertTrue(raw.endswith('"voice_mode":"lesson","lesson_chunks":1}'))
 
+    def test_lesson_mode_initial_chunks_zero(self):
+        mod, client, _ = self._lesson_app()
+        self.assertEqual(mod._lesson_last_chunks, 0)
+        self.assertEqual(mod._lesson_sessions, {})
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["lesson_chunks"], 0)
+
+    def test_photo_status_keeps_count_after_final(self):
+        mod, client, _ = self._lesson_app()
+        client.post("/api/voice-chunk", headers=self._hdr("keepL", 0), data=_wav(10))
+        resp = client.post("/api/voice-chunk", headers=self._hdr("keepL", 1, final=True),
+                           data=_wav(10))
+        self.assertEqual(resp.get_json()["lesson_chunks"], 2)
+        self.assertEqual(mod._lesson_sessions, {})
+        # После стопа сессий нет — счётчик отдаёт последнюю финализацию, а не 0.
+        self.assertEqual(mod._lesson_last_chunks, 2)
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["lesson_chunks"], 2)
+
+    def test_photo_status_keeps_count_after_ttl_finalize(self):
+        mod, client, _ = self._lesson_app()
+        client.post("/api/voice-chunk", headers=self._hdr("ttlKeep", 0), data=_wav(10))
+        client.post("/api/voice-chunk", headers=self._hdr("ttlKeep", 1), data=_wav(10))
+        mod._lesson_sessions["ttlKeep"]["created_at"] = (
+            time.time() - mod.VOICE_SESSION_TTL - 10)
+        with mod._lesson_lock:
+            evicted = mod._sweep_lesson_sessions_locked(time.time())
+        self.assertEqual(evicted, 1)
+        self.assertEqual(mod._lesson_sessions, {})
+        self.assertEqual(mod._lesson_last_chunks, 2)
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["lesson_chunks"], 2)
+
+    def test_new_lesson_reports_own_smaller_count(self):
+        mod, client, _ = self._lesson_app()
+        for idx in range(4):
+            client.post("/api/voice-chunk", headers=self._hdr("bigL", idx), data=_wav(10))
+        client.post("/api/voice-chunk", headers=self._hdr("bigL", 4, final=True),
+                    data=_wav(10))
+        self.assertEqual(mod._lesson_last_chunks, 5)
+        client.post("/api/voice-chunk", headers=self._hdr("smallL", 0), data=_wav(10))
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["lesson_chunks"], 1)
+
+    def test_qa_mode_keeps_lesson_chunks_zero(self):
+        mod, client = fresh_app()
+        self.assertEqual(client.get("/api/voice-mode", headers=HEADERS).get_json()["mode"],
+                         "qa")
+        with mock.patch.object(mod, "call_gemini", return_value="ans"):
+            resp = client.post("/api/voice-chunk",
+                               headers=self._hdr("qaZero", 0, final=True), data=_wav())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(mod._lesson_last_chunks, 0)
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["lesson_chunks"], 0)
+
     def test_disk_failure_500_no_session_state(self):
         mod, client, lessons = self._lesson_app()
         blocked = os.path.join(lessons, "blocked")

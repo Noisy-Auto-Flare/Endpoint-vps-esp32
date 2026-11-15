@@ -168,6 +168,7 @@ _voice_mode = VOICE_MODE_QA
 # Файл держим открытым: дописываем PCM и на каждом чанке переписываем RIFF-заголовок.
 _lesson_lock = threading.Lock()
 _lesson_sessions = {}
+_lesson_last_chunks = 0   # чанков в последней закрытой записи (для счётчика в ридере)
 
 # Стейджинг фото-кадров v2 (один глобальный, как слоты ответов — одна связка устройств).
 # Короткие нажатия складывают кадры сюда, удержание коммитит всё в Gemini разом.
@@ -712,6 +713,7 @@ def _lesson_abort_locked(session_id: str, session, err_class: str):
 
 def _finalize_lesson_locked(session_id: str, ended_at: float, reason: str):
     """Закрывает WAV урока и пишет JSON-сайдкар. Возвращает сводку или None."""
+    global _lesson_last_chunks
     session = _lesson_sessions.pop(session_id, None)
     if session is None:
         return None
@@ -723,6 +725,8 @@ def _finalize_lesson_locked(session_id: str, ended_at: float, reason: str):
         print(f"[lesson] close fail reason={reason} sid_tail={tail} "
               f"err_class={type(e).__name__}", flush=True)
     duration_sec = round(max(0.0, ended_at - session["started_at"]), 1)
+    # Лок уже держит вызывающий (_handle_lesson_chunk/_sweep) — не берём повторно.
+    _lesson_last_chunks = len(session["chunks"])   # счётчик для ридера после стопа
     sidecar = {
         "sid": session["sid"],
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(session["started_at"])),
@@ -1097,8 +1101,12 @@ def get_photo_status():
     voice_busy = _get_voice_busy()
     voice_mode = _get_voice_mode()
     with _lesson_lock:
-        # Активная запись урока одна; если её нет — 0 записанных чанков.
-        lesson_chunks = max((len(s["chunks"]) for s in _lesson_sessions.values()), default=0)
+        # Активная запись урока одна; пока её нет — показываем размер последней
+        # законченной записи (после стопа счётчик не обнуляется).
+        if _lesson_sessions:
+            lesson_chunks = max((len(s["chunks"]) for s in _lesson_sessions.values()), default=0)
+        else:
+            lesson_chunks = _lesson_last_chunks
 
     # Новые ключи в конце: старый парсер microReader их просто игнорирует.
     response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready,
