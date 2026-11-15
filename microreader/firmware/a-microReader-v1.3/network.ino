@@ -165,8 +165,9 @@ String photoStatusRu(const String& s) {
 }
 
 // Опрос GET /api/photo-status. Возвращает true при HTTP 200.
-// На выходе: staged, photoStatus, answerReady, voiceBusy (missing key = false).
-bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy) {
+// На выходе: staged, photoStatus, answerReady, voiceBusy, lessonChunks
+// (missing key = false / 0 — старый сервер не ломает Меню 3).
+bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy, int &lessonChunks) {
     WiFiClient client;
     HTTPClient http;
     String url;
@@ -201,6 +202,12 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool 
         if (pVb >= 0) {
             voiceBusy = response.substring(pVb + 12, pVb + 12 + 6).indexOf("true") >= 0;
         }
+        // lesson_chunks опционален: нет ключа = 0 (режим qa / старый сервер).
+        lessonChunks = 0;
+        int pLc = response.indexOf("\"lesson_chunks\":");
+        if (pLc >= 0) {
+            lessonChunks = response.substring(pLc + 16).toInt();
+        }
         ok = true;
     } else {
         oled.clear(); oled.home();
@@ -213,10 +220,74 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool 
     return ok;
 }
 
-// Совместимость со старым меню статуса (без voice_busy).
+// Совместимость со старым меню статуса (без lesson_chunks).
+bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady, bool &voiceBusy) {
+    int dummyChunks = 0;
+    return fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, dummyChunks);
+}
+
+// Совместимость со старым меню статуса (без voice_busy / lesson_chunks).
 bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
     bool dummyBusy = false;
-    return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy);
+    int dummyChunks = 0;
+    return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy, dummyChunks);
+}
+
+// GET /api/voice-mode -> mode ("qa"/"lesson"), true при HTTP 200.
+// Нет ключа mode в ответе -> "qa". Молча: экран рисует вызывающий код.
+bool fetchVoiceMode(String &mode) {
+    WiFiClient client;
+    HTTPClient http;
+    String url;
+    url.reserve(112);  // пресайз: меньше переаллокаций кучи на ESP8266
+    url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/voice-mode";
+
+    http.begin(client, url);
+    http.addHeader("X-Device-Key", sets.deviceKey);
+    http.setTimeout(10000);
+
+    int httpCode = http.GET();
+    String parsed = "qa";  // нет ключа mode в ответе -> "qa"
+    bool ok = (httpCode == 200);
+
+    if (ok) {
+        String response = http.getString();
+        int pMode = response.indexOf("\"mode\":\"");
+        if (pMode >= 0) {
+            int vStart = pMode + 8;  // длина "mode":"
+            int vEnd = response.indexOf("\"", vStart);
+            if (vEnd > vStart) {
+                String m = response.substring(vStart, vEnd);
+                if (m == "qa" || m == "lesson") parsed = m;
+            }
+        }
+        mode = parsed;  // при ошибке оставляем прежнее значение
+    }
+
+    http.end();
+    return ok;
+}
+
+// POST /api/voice-mode {"mode":"qa"|"lesson"}, true при HTTP 200.
+bool postVoiceMode(const String &mode) {
+    WiFiClient client;
+    HTTPClient http;
+    String url;
+    url.reserve(112);  // пресайз: меньше переаллокаций кучи на ESP8266
+    url = "http://" + String(sets.backendHost) + ":" + String(sets.backendPort) + "/api/voice-mode";
+    String body;
+    body.reserve(32);
+    body = "{\"mode\":\"" + mode + "\"}";
+
+    http.begin(client, url);
+    http.addHeader("X-Device-Key", sets.deviceKey);
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(10000);
+
+    int httpCode = http.POST(body);
+
+    http.end();
+    return httpCode == 200;
 }
 
 // Окно статуса фото: 4 строки.

@@ -10,6 +10,7 @@ bool ansExitToMain = false;  // Меню 3 просит Меню 2 сразу в
 
 String monLines[3];          // живые строки состояния Меню 3
 int monLineCount = 0;
+String voiceMode = "qa";     // режим сервера: "qa" (вопрос-ответ) | "lesson" (урок)
 
 // Список /answer_*.txt, сортировка по номеру: НОВЫЕ -> СТАРЫЕ.
 void ansRebuildList() {
@@ -74,15 +75,18 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
   oled.line(0, 10, 127, 10);
   oled.print(F("МОНИТОРИНГ"));
 
-  int totalRows = 1 + monLineCount;  // строка 0 — кнопка, далее статус
+  int totalRows = 2 + monLineCount;  // 0 — тумблер, 1 — режим, далее статус
   int sidx = (ansCursor < 6 ? 0 : ansCursor - 5);
   for (int r = sidx; r < sidx + 6 && r < totalRows; r++) {
     oled.setCursor(6, 2 + (r - sidx));
     if (r == 0) {
       if (monitoring) oled.print(F("Мониторинг: ВКЛ"));
       else oled.print(F("Мониторинг: ВЫКЛ"));
+    } else if (r == 1) {
+      if (voiceMode == "lesson") oled.print(F("Режим: Урок"));
+      else oled.print(F("Режим: Вопрос-ответ"));
     } else {
-      oled.print(monLines[r - 1]);
+      oled.print(monLines[r - 2]);
     }
     yield();
   }
@@ -96,13 +100,35 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
   oled.update();
 }
 
+// Опрос сервера для Меню 3: GET /api/photo-status + GET /api/voice-mode.
+// true — статус получен (monLines заполнены), false — ошибка сервера.
+bool ansPollMonitor(bool &monReady) {
+  int staged = 0;
+  String photoStatus = "idle";
+  bool answerReady = false;
+  bool voiceBusy = false;
+  int lessonChunks = 0;
+  if (!fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, lessonChunks)) {
+    return false;
+  }
+  fetchVoiceMode(voiceMode);  // строка режима всегда показывает состояние сервера
+  monReady = answerReady;
+  monLineCount = 0;
+  monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
+  monLines[monLineCount++] = "кадров на сервере: " + String(staged);
+  if (voiceMode == "lesson" && monLineCount < 3) {
+    monLines[monLineCount].reserve(32);
+    monLines[monLineCount++] = "чанков урока: " + String(lessonChunks);
+  }
+  if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
+  else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
+  return true;
+}
+
 void enterMonitorMenu() {
   ansExitToMain = false;
   bool monitoring = false;
   bool monReady = false;
-  int staged = 0;
-  String photoStatus = "idle";
-  bool voiceBusy = false;
   int ansCursor = 0;
   unsigned long enterTime = millis();
   unsigned long lastPoll = 0;
@@ -130,7 +156,7 @@ void enterMonitorMenu() {
       return;
     }
 
-    int totalRows = 1 + monLineCount;
+    int totalRows = 2 + monLineCount;  // 0 — тумблер, 1 — режим, далее статус
     if (up.click()) {
       uiTimer = millis();
       ansCursor = constrain(ansCursor - 1, 0, totalRows - 1);
@@ -143,7 +169,36 @@ void enterMonitorMenu() {
 
     if (ok.click()) {
       uiTimer = millis();
-      if (monitoring && monReady) {
+      if (ansCursor == 1) {
+        // Строка режима: OK переключает режим сервера (qa <-> lesson)
+        if (!monitoring) {
+          monLineCount = 1;
+          monLines[0] = "включи мониторинг";
+          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          ansDrawMonitor(ansCursor, monitoring);
+        } else {
+          String want = (voiceMode == "lesson") ? "qa" : "lesson";
+          oled.clear(); oled.home();
+          oled.println("Режим:");
+          oled.print(want == "lesson" ? "Урок" : "Вопрос-ответ");
+          oled.update();
+          if (postVoiceMode(want)) {
+            voiceMode = want;  // строка режима обновляется сразу
+            if (!ansPollMonitor(monReady)) {
+              monReady = false;
+              monLineCount = 1;
+              monLines[0] = "ошибка сервера";
+            }
+          } else {
+            monReady = false;
+            monLineCount = 1;
+            monLines[0] = "ошибка смены режима";
+          }
+          lastPoll = millis();
+          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          ansDrawMonitor(ansCursor, monitoring);
+        }
+      } else if (monitoring && monReady) {
         // Ответ готов: OK забирает и сохраняет, мониторинг остаётся ВКЛ
         ansRebuildList();
         int oldNums[ANS_MAX];
@@ -166,13 +221,14 @@ void enterMonitorMenu() {
           monLines[monLineCount++] = "сохранено:";
           if (monLineCount < 3) monLines[monLineCount++] = newFn;
         } else {
+          // Не забрали: обновляем статус, ответ не предлагаем повторно
           monReady = false;
-          monLineCount = 1;
-          monLines[0].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
-          monLines[0] = "кадров на сервере: " + String(staged);
-          if (voiceBusy && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
+          if (!ansPollMonitor(monReady)) {
+            monLineCount = 1;
+            monLines[0] = "ошибка сервера";
+          }
         }
-        ansCursor = constrain(ansCursor, 0, monLineCount);
+        ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
         lastPoll = millis();
         ansDrawMonitor(ansCursor, monitoring);
       } else if (ansCursor == 0) {
@@ -204,21 +260,13 @@ void enterMonitorMenu() {
               ansDrawMonitor(ansCursor, monitoring);
             } else {
               monitoring = true;
-              bool answerReady = false;
-              if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
-                monReady = answerReady;
-                monLineCount = 0;
-                monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
-                monLines[monLineCount++] = "кадров на сервере: " + String(staged);
-                if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
-                else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
-              } else {
+              if (!ansPollMonitor(monReady)) {
                 monReady = false;
                 monLineCount = 1;
                 monLines[0] = "ошибка сервера";
               }
               lastPoll = millis();
-              ansCursor = constrain(ansCursor, 0, monLineCount);
+              ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
               ansDrawMonitor(ansCursor, monitoring);
             }
           }
@@ -228,7 +276,7 @@ void enterMonitorMenu() {
           WiFi.mode(WIFI_OFF);
           monLineCount = 1;
           monLines[0] = "выключено";
-          ansCursor = constrain(ansCursor, 0, monLineCount);
+          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
           ansDrawMonitor(ansCursor, monitoring);
         }
       }
@@ -239,20 +287,12 @@ void enterMonitorMenu() {
     // вдвое меньше String-чёрна и мусора в Serial, UX тот же — ответ забирается вручную по OK)
     if (monitoring && millis() - lastPoll >= 2000) {
       lastPoll = millis();
-      bool answerReady = false;
-      if (fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy)) {
-        monReady = answerReady;
-        monLineCount = 0;
-        monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
-        monLines[monLineCount++] = "кадров на сервере: " + String(staged);
-        if (monReady && monLineCount < 3) monLines[monLineCount++] = "ответ получен";
-        else if (voiceBusy && !monReady && monLineCount < 3) monLines[monLineCount++] = "голос: думаю...";
-      } else {
+      if (!ansPollMonitor(monReady)) {
         monReady = false;
         monLineCount = 1;
         monLines[0] = "ошибка сервера";
       }
-      ansCursor = constrain(ansCursor, 0, monLineCount);
+      ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
       ansDrawMonitor(ansCursor, monitoring);
     }
 
