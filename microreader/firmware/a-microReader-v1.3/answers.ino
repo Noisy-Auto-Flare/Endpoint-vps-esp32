@@ -84,7 +84,7 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
       else oled.print(F("Мониторинг: ВЫКЛ"));
     } else if (r == 1) {
       if (voiceMode == "lesson") oled.print(F("Режим: Урок"));
-      else oled.print(F("Режим: Вопрос-ответ"));
+      else oled.print(F("Режим: Вопросы"));
     } else {
       oled.print(monLines[r - 2]);
     }
