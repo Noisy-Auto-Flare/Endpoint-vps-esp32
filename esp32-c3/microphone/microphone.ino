@@ -25,10 +25,11 @@
  *
  * Пины:
  *   GPIO4  — OUT микрофона MAX4466 (ADC1_CH4)
- *   GPIO9  — кнопка (BOOT): старт/стоп записи
- *   GPIO8  — встроенный синий LED: один длинный миг = старт записи
- *            (постоянно НЕ горит: LED_SOLID_WHILE_RECORDING = false);
- *            2 мига = ошибка отправки; 3 мига = сессия успешно завершена;
+ *   GPIO3  — внешняя кнопка на GND: старт/стоп записи (INPUT_PULLUP).
+ *            BOOT/GPIO9 — аппаратный strap платы, прошивка его игнорирует.
+ *   GPIO8  — встроенный синий LED: горит ВЕСЬ урок, пока идёт запись,
+ *            гаснет на стопе; 2 мига = ошибка отправки;
+ *            3 мига = сессия успешно завершена;
  *            5 миганий = фатальная ошибка (SPIFFS/Wi-Fi)
  */
 
@@ -42,7 +43,7 @@
 // ============================ ПИНЫ И ПАРАМЕТРЫ ============================
 
 constexpr int      MIC_PIN       = 4;      // ADC1_CH4 на ESP32-C3
-constexpr int      BUTTON_PIN    = 9;      // BOOT, INPUT_PULLUP
+constexpr int      BUTTON_PIN    = 3;      // внешняя кнопка: GPIO3 -> GND, INPUT_PULLUP
 constexpr int      LED_PIN       = 8;      // SuperMini: светится при LOW
 
 constexpr uint32_t SAMPLE_RATE   = 16000;  // Гц — держится железом (DMA)
@@ -77,9 +78,8 @@ constexpr uint32_t UPLOAD_QUEUE_LEN = 8;
 // (дыра в аудио остаётся навсегда). Повторяем только при ошибке.
 constexpr int      UPLOAD_RETRIES         = 3;
 constexpr uint32_t UPLOAD_RETRY_PAUSE_MS  = 2000;
-// Постоянное свечение LED во время записи. По умолчанию ВЫКЛ: урок идёт
-// 40-90 минут, горящий светодиод демаскирует устройство перед учителем.
-constexpr bool LED_SOLID_WHILE_RECORDING = false;
+// Синий LED горит ровно ВСЮ запись и гаснет на стопе: видно, что устройство
+// пишет. Мигающие коды 3/2/5 остаются только на финале сессии.
 constexpr const char* LEGACY_CHUNK_FILES[] = { "/chk_a.wav", "/chk_b.wav" };
 
 // ============================ СОСТОЯНИЕ ===================================
@@ -303,11 +303,7 @@ void samplerTask(void*) {
     adc_continuous_read(adcHandle, frame, sizeof(frame), &got, pdMS_TO_TICKS(500));
 
     recordingActive = true;
-    if (LED_SOLID_WHILE_RECORDING) {
-      ledOn();
-    } else {
-      blinkLed(1, 300, 0);   // один длинный миг = запись началась (LED не горит постоянно)
-    }
+    ledOn();   // синий LED горит всю запись; стартового длинного мига нет
     Serial.println(">>> Запись НАЧАЛАСЬ, сессия: " + sessionId);
 
     bool stopping = false;
@@ -402,7 +398,7 @@ void samplerTask(void*) {
 
     adcStopCapture();
     recordingActive = false;
-    if (LED_SOLID_WHILE_RECORDING) ledOff();
+    ledOff();   // запись окончена — гасим синий LED
     Serial.println(">>> Запись завершена");
 
 sessionEnd:;
