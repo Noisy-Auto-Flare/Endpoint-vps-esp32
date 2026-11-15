@@ -143,7 +143,17 @@ bool ansPollMonitor() {
     monVoiceBusy = false;
     return false;
   }
-  if (fetchVoiceMode(voiceMode)) voiceModeKnown = true;  // при ошибке — прежний режим и прежний флаг
+  // Режим спрашиваем не каждый опрос: пока не подтверждён — сразу, дальше
+  // каждый 5-й (~10 с при периоде 2 с), чтобы поймать рестарт сервера.
+  static uint8_t modePollTick = 0;
+  bool pollMode = !voiceModeKnown;
+  if (++modePollTick >= 5) {  // uint8_t не переполнится: сброс на каждом 5-м
+    modePollTick = 0;
+    pollMode = true;
+  }
+  if (pollMode) {
+    if (fetchVoiceMode(voiceMode)) voiceModeKnown = true;  // при ошибке — прежний режим и прежний флаг
+  }
   return true;
 }
 

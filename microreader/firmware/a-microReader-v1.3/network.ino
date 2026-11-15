@@ -293,7 +293,7 @@ bool fetchVoiceMode(String &mode) {
 
     http.begin(client, url);
     http.addHeader("X-Device-Key", sets.deviceKey);
-    http.setTimeout(10000);
+    http.setTimeout(3000);  // 3 с: режим спрашивается в опросе, не должен вешать меню
 
     int httpCode = http.GET();
     bool ok = false;
