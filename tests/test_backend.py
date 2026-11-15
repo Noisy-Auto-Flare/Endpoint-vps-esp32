@@ -11,6 +11,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -77,11 +78,49 @@ class AuthTest(unittest.TestCase):
             ("post", "/api/photos", {"json": {"images": ["aGVsbG8="]}}),
             ("post", "/api/voice", {"data": _wav(10)}),
             ("post", "/api/voice-chunk", {"data": _wav(10), "headers": chunk_headers}),
+            ("get", "/api/voice-mode", {}),
+            ("post", "/api/voice-mode", {"json": {"mode": "lesson"}}),
         ]:
             with self.subTest(path=path):
                 resp = getattr(client, method)(path, **kwargs)
                 self.assertEqual(resp.status_code, 401)
                 self.assertEqual(resp.get_json()["error"], "unauthorized")
+
+
+class VoiceModeTest(unittest.TestCase):
+    def test_default_mode_qa(self):
+        _, client = fresh_app()
+        resp = client.get("/api/voice-mode", headers=HEADERS)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"mode": "qa"})
+
+    def test_post_switch_and_get(self):
+        _, client = fresh_app()
+        resp = client.post("/api/voice-mode", headers=HEADERS, json={"mode": "lesson"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"ok": True, "mode": "lesson"})
+        self.assertEqual(client.get("/api/voice-mode", headers=HEADERS).get_json(),
+                         {"mode": "lesson"})
+        back = client.post("/api/voice-mode", headers=HEADERS, json={"mode": "qa"})
+        self.assertEqual(back.status_code, 200)
+        self.assertEqual(back.get_json(), {"ok": True, "mode": "qa"})
+        self.assertEqual(client.get("/api/voice-mode", headers=HEADERS).get_json(),
+                         {"mode": "qa"})
+
+    def test_bad_mode_400_keeps_state(self):
+        mod, client = fresh_app()
+        for payload in ({"mode": "bogus"}, {"mode": ""}, {}, {"mode": 123}):
+            with self.subTest(payload=payload):
+                resp = client.post("/api/voice-mode", headers=HEADERS, json=payload)
+                self.assertEqual(resp.status_code, 400)
+                self.assertIn("error", resp.get_json())
+        self.assertEqual(mod._get_voice_mode(), "qa")
+
+    def test_non_json_body_400(self):
+        _, client = fresh_app()
+        resp = client.post("/api/voice-mode", headers=HEADERS,
+                           data="not json", content_type="application/json")
+        self.assertEqual(resp.status_code, 400)
 
 
 class PhotoFrameTest(unittest.TestCase):
@@ -151,7 +190,8 @@ class PhotoStatusTest(unittest.TestCase):
     def test_idle_shape(self):
         _, client = fresh_app()
         body = client.get("/api/photo-status", headers=HEADERS).get_json()
-        self.assertEqual(body, {"staged": 0, "photo_status": "idle", "answer_ready": False, "voice_busy": False})
+        self.assertEqual(body, {"staged": 0, "photo_status": "idle", "answer_ready": False,
+                                "voice_busy": False, "voice_mode": "qa", "lesson_chunks": 0})
 
     def test_staged_shape(self):
         _, client = fresh_app()
@@ -517,6 +557,8 @@ class CompactJsonTest(unittest.TestCase):
         self.assertEqual(resp.mimetype, "application/json")
         raw = resp.get_data(as_text=True)
         self.assertIn('"staged":0', raw)
+        self.assertIn('"voice_busy":false,"voice_mode":"qa","lesson_chunks":0}', raw)
+        self.assertNotIn('": ', raw)
         self.assertNotIn('": ', raw)
 
 
@@ -919,6 +961,181 @@ class WavValidationTest(unittest.TestCase):
         resp = client.post("/api/voice-chunk", headers=vheaders, data=b"GARBAGE" * 20)
         self.assertEqual(resp.status_code, 400)
         self.assertIn("error", resp.get_json())
+
+
+class LessonModeTest(unittest.TestCase):
+    def _lesson_app(self):
+        mod, client = fresh_app()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mod.LESSONS_DIR = tmp.name
+
+        def _close_sessions():
+            with mod._lesson_lock:
+                for sid in list(mod._lesson_sessions):
+                    mod._finalize_lesson_locked(sid, time.time(), reason="test")
+
+        # LIFO: сначала закрываем открытые файлы, потом удаляем временную папку.
+        self.addCleanup(_close_sessions)
+        resp = client.post("/api/voice-mode", headers=HEADERS, json={"mode": "lesson"})
+        self.assertEqual(resp.status_code, 200)
+        return mod, client, tmp.name
+
+    def _hdr(self, sid, idx, final=False):
+        d = dict(HEADERS, **{"X-Session-Id": sid, "X-Chunk-Index": str(idx),
+                             "Content-Type": "audio/wav"})
+        if final:
+            d["X-Final"] = "true"
+        return d
+
+    def test_lesson_max_chunks_default_2000(self):
+        os.environ.pop("LESSON_MAX_CHUNKS", None)
+        mod, _ = fresh_app()
+        self.assertEqual(mod.LESSON_MAX_CHUNKS, 2000)
+        self.assertNotEqual(mod.LESSON_MAX_CHUNKS, mod.VOICE_MAX_CHUNKS)
+
+    def test_lesson_chunk_appends_pcm_and_final_writes_sidecar(self):
+        mod, client, lessons = self._lesson_app()
+        c0, c1 = _wav(10), _wav(20)
+        with (
+            mock.patch.object(mod, "call_gemini") as g,
+            mock.patch.object(mod, "transcribe_groq") as t,
+        ):
+            r0 = client.post("/api/voice-chunk", headers=self._hdr("lesson1", 0), data=c0)
+            r1 = client.post("/api/voice-chunk", headers=self._hdr("lesson1", 1, final=True),
+                            data=c1)
+        self.assertEqual(r0.status_code, 200)
+        self.assertEqual(r0.get_json(), {"ok": True, "chunks_received": 1})
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.get_json(),
+                         {"ok": True, "final": True, "mode": "lesson", "lesson_chunks": 2})
+        self.assertEqual(g.call_count, 0)
+        self.assertEqual(t.call_count, 0)
+
+        names = sorted(os.listdir(lessons))
+        self.assertEqual(len(names), 2)
+        wav_name = next(n for n in names if n.endswith(".wav"))
+        json_name = next(n for n in names if n.endswith(".json"))
+        self.assertEqual(os.path.splitext(wav_name)[0], os.path.splitext(json_name)[0])
+        self.assertRegex(wav_name,
+                         r"^lesson_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_lesson1\.wav$")
+
+        with open(os.path.join(lessons, wav_name), "rb") as fh:
+            raw = fh.read()
+        expected_pcm = c0[44:] + c1[44:]
+        self.assertEqual(raw[0:4], b"RIFF")
+        self.assertEqual(raw[8:12], b"WAVE")
+        (riff_size,) = struct.unpack("<I", raw[4:8])
+        (data_size,) = struct.unpack("<I", raw[40:44])
+        self.assertEqual(data_size, len(expected_pcm))
+        self.assertEqual(riff_size, 36 + len(expected_pcm))
+        self.assertEqual(len(raw), 44 + len(expected_pcm))
+        self.assertEqual(raw[44:], expected_pcm)
+
+        with open(os.path.join(lessons, json_name), encoding="utf-8") as fh:
+            sidecar = json.load(fh)
+        self.assertEqual(sidecar["sid"], "lesson1")
+        self.assertEqual(sidecar["chunks"], 2)
+        self.assertGreaterEqual(sidecar["duration_sec"], 0)
+        self.assertIn("T", sidecar["started_at"])
+        self.assertIn("T", sidecar["ended_at"])
+
+    def test_duplicate_index_not_appended_twice(self):
+        mod, client, lessons = self._lesson_app()
+        c = _wav(10)
+        client.post("/api/voice-chunk", headers=self._hdr("dupl", 0), data=c)
+        client.post("/api/voice-chunk", headers=self._hdr("dupl", 0), data=c)
+        resp = client.post("/api/voice-chunk", headers=self._hdr("dupl", 1, final=True), data=c)
+        self.assertEqual(resp.get_json()["lesson_chunks"], 2)
+        wav_name = next(n for n in os.listdir(lessons) if n.endswith(".wav"))
+        self.assertEqual(os.path.getsize(os.path.join(lessons, wav_name)),
+                         44 + 2 * len(c[44:]))
+
+    def test_qa_mode_still_calls_gemini(self):
+        mod, client = fresh_app()
+        self.assertEqual(client.get("/api/voice-mode", headers=HEADERS).get_json()["mode"], "qa")
+        with mock.patch.object(mod, "call_gemini", return_value="ans") as g:
+            resp = client.post("/api/voice-chunk",
+                               headers=self._hdr("qa1", 0, final=True), data=_wav())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["text"], "ans")
+        self.assertEqual(g.call_count, 1)
+        self.assertEqual(mod._lesson_sessions, {})
+
+    def test_photo_status_trailing_keys(self):
+        mod, client, _ = self._lesson_app()
+        client.post("/api/voice-chunk", headers=self._hdr("statusL", 0), data=_wav(10))
+        body = client.get("/api/photo-status", headers=HEADERS).get_json()
+        self.assertEqual(body["voice_mode"], "lesson")
+        self.assertEqual(body["lesson_chunks"], 1)
+        self.assertEqual(list(body)[-2:], ["voice_mode", "lesson_chunks"])
+        raw = client.get("/api/photo-status", headers=HEADERS).get_data(as_text=True)
+        self.assertTrue(raw.endswith('"voice_mode":"lesson","lesson_chunks":1}'))
+
+    def test_disk_failure_500_no_session_state(self):
+        mod, client, lessons = self._lesson_app()
+        blocked = os.path.join(lessons, "blocked")
+        with open(blocked, "wb") as fh:
+            fh.write(b"x")
+        mod.LESSONS_DIR = blocked
+        resp = client.post("/api/voice-chunk", headers=self._hdr("disk1", 0), data=_wav(10))
+        self.assertEqual(resp.status_code, 500)
+        self.assertIn("error", resp.get_json())
+        self.assertEqual(mod._lesson_sessions, {})
+
+    def test_append_failure_500_closes_session(self):
+        mod, client, _ = self._lesson_app()
+        r0 = client.post("/api/voice-chunk", headers=self._hdr("disk2", 0), data=_wav(10))
+        self.assertEqual(r0.status_code, 200)
+        fh = mod._lesson_sessions["disk2"]["file"]
+        with mock.patch.object(mod, "_append_lesson_pcm_locked", side_effect=OSError("disk full")):
+            resp = client.post("/api/voice-chunk", headers=self._hdr("disk2", 1), data=_wav(10))
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(mod._lesson_sessions, {})
+        self.assertTrue(fh.closed)
+
+    def test_ttl_sweep_finalizes_file_and_sidecar(self):
+        mod, client, lessons = self._lesson_app()
+        client.post("/api/voice-chunk", headers=self._hdr("ttlL", 0), data=_wav(10))
+        fh = mod._lesson_sessions["ttlL"]["file"]
+        mod._lesson_sessions["ttlL"]["created_at"] = time.time() - mod.VOICE_SESSION_TTL - 10
+        resp = client.post("/api/voice-chunk", headers=self._hdr("ttlL2", 0), data=_wav(10))
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("ttlL", mod._lesson_sessions)
+        self.assertIn("ttlL2", mod._lesson_sessions)
+        self.assertTrue(fh.closed)
+        # Старая запись финализирована (WAV + JSON), новая ведётся (только WAV).
+        self.assertEqual(len([n for n in os.listdir(lessons) if n.endswith(".wav")]), 2)
+        self.assertEqual(len([n for n in os.listdir(lessons) if n.endswith(".json")]), 1)
+        json_name = next(n for n in os.listdir(lessons) if n.endswith(".json"))
+        with open(os.path.join(lessons, json_name), encoding="utf-8") as f:
+            sidecar = json.load(f)
+        self.assertEqual(sidecar["sid"], "ttlL")
+        self.assertEqual(sidecar["chunks"], 1)
+
+    def test_lesson_cap_independent_from_voice_cap(self):
+        mod, client, _ = self._lesson_app()
+        mod.VOICE_MAX_CHUNKS = 1
+        r0 = client.post("/api/voice-chunk", headers=self._hdr("capL", 0), data=_wav(10))
+        r1 = client.post("/api/voice-chunk", headers=self._hdr("capL", 1, final=True), data=_wav(10))
+        self.assertEqual(r0.status_code, 200)
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r1.get_json()["lesson_chunks"], 2)
+
+        mod.LESSON_MAX_CHUNKS = 1
+        a0 = client.post("/api/voice-chunk", headers=self._hdr("capL2", 0), data=_wav(10))
+        a1 = client.post("/api/voice-chunk", headers=self._hdr("capL2", 1), data=_wav(10))
+        self.assertEqual(a0.status_code, 200)
+        self.assertEqual(a1.status_code, 413)
+        self.assertNotIn("capL2", mod._lesson_sessions)
+
+    def test_garbage_chunk_400_no_file(self):
+        mod, client, lessons = self._lesson_app()
+        resp = client.post("/api/voice-chunk", headers=self._hdr("bad", 0),
+                           data=b"GARBAGE" * 20)
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(os.path.isdir(lessons) and os.listdir(lessons))
+        self.assertEqual(mod._lesson_sessions, {})
 
 
 if __name__ == "__main__":

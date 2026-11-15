@@ -12,6 +12,9 @@ __pycache__/
 *.pyc
 venv/
 
+# Записи уроков (режим lesson пишет сюда WAV + JSON-сайдкары)
+lessons/
+
 # Arduino compiled binaries
 *.bin
 *.elf

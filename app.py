@@ -107,6 +107,8 @@ PHOTO_SYSTEM_PROMPT = os.environ.get(
 # склейка в один WAV и отправка в Gemini при приходе финального чанка.
 VOICE_SESSION_TTL = int(os.environ.get("VOICE_SESSION_TTL", "600"))          # секунд: сессия без финального чанка сгорает
 VOICE_MAX_CHUNKS = int(os.environ.get("VOICE_MAX_CHUNKS", "20"))            # максимум чанков на сессию (20 * 5 сек = 100 сек записи)
+# Отдельный лимит чанков для режима урока: 2000 * 5 сек ≈ 2.7 часа записи.
+LESSON_MAX_CHUNKS = int(os.environ.get("LESSON_MAX_CHUNKS", "2000"))
 VOICE_CHUNK_MAX_BYTES = int(os.environ.get("VOICE_CHUNK_MAX_BYTES", str(1 * 1024 * 1024)))
 VOICE_MAX_SESSIONS = int(os.environ.get("VOICE_MAX_SESSIONS", "50"))
 PHOTO_MAX_BYTES = int(os.environ.get("PHOTO_MAX_BYTES", str(2 * 1024 * 1024)))
@@ -121,6 +123,15 @@ PHOTOS_MAX_TOTAL_B64 = int(os.environ.get("PHOTOS_MAX_TOTAL_B64", str(6 * 1024 *
 # файл лежит в LittleFS 2MB — без капа безграничная проза Gemini единственный
 # безграничный аллок. Обрезка пост-фактум, промпты не трогаем.
 MAX_ANSWER_CHARS = int(os.environ.get("MAX_ANSWER_CHARS", "8000"))
+
+# Режимы голоса: "qa" — как раньше (чанки -> Gemini), "lesson" — запись урока в файлы.
+# Переключается ридером через /api/voice-mode; микрофон о режиме не знает.
+VOICE_MODE_QA = "qa"
+VOICE_MODE_LESSON = "lesson"
+VOICE_MODES = (VOICE_MODE_QA, VOICE_MODE_LESSON)
+
+# Записи уроков лежат в lessons/ рядом с app.py (директория в .gitignore).
+LESSONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lessons")
 
 # =====================================================================
 
@@ -147,6 +158,16 @@ _voice_busy = False
 # Чанки хранятся по X-Chunk-Index, на финале сортируются по индексу.
 _voice_sessions_lock = threading.Lock()
 _voice_sessions = {}
+
+# Глобальный режим голоса (qa|lesson) под локом: пишут роуты, читают чанки и статус.
+_voice_mode_lock = threading.Lock()
+_voice_mode = VOICE_MODE_QA
+
+# Активные записи уроков: session_id -> {"sid", "file", "path", "json_path",
+#   "started_at", "created_at", "chunks" (набор индексов), "data_bytes"}.
+# Файл держим открытым: дописываем PCM и на каждом чанке переписываем RIFF-заголовок.
+_lesson_lock = threading.Lock()
+_lesson_sessions = {}
 
 # Стейджинг фото-кадров v2 (один глобальный, как слоты ответов — одна связка устройств).
 # Короткие нажатия складывают кадры сюда, удержание коммитит всё в Gemini разом.
@@ -311,6 +332,31 @@ def _wav_data_offset(chunk: bytes) -> int:
     raise RuntimeError("unsupported wav format: data subchunk not found")
 
 
+def _wav_header(data_size: int) -> bytes:
+    """44-байтный RIFF-заголовок WAV 16 кГц / 16 бит / моно."""
+    sample_rate = 16000
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        36 + data_size,
+        b"WAVE",
+        b"fmt ",
+        16,                       # subchunk1 size
+        1,                        # audio format: PCM
+        num_channels,
+        sample_rate,
+        byte_rate,
+        block_align,
+        bits_per_sample,
+        b"data",
+        data_size,
+    )
+
+
 def merge_wav_chunks(chunks: list) -> bytes:
     """
     Склеивает несколько WAV-файлов (16 кГц, 16 бит, моно) в один WAV.
@@ -333,29 +379,7 @@ def merge_wav_chunks(chunks: list) -> bytes:
     if total_data_size == 0:
         raise RuntimeError("chunks contain no audio data")
 
-    sample_rate = 16000
-    num_channels = 1
-    bits_per_sample = 16
-    byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels * bits_per_sample // 8
-
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        36 + total_data_size,
-        b"WAVE",
-        b"fmt ",
-        16,                       # subchunk1 size
-        1,                        # audio format: PCM
-        num_channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b"data",
-        total_data_size,
-    )
-    return header + b"".join(data_parts)
+    return _wav_header(total_data_size) + b"".join(data_parts)
 
 
 def transcribe_groq(wav_bytes: bytes) -> str:
@@ -540,6 +564,265 @@ def handle_voice():
 
 
 # ---------------------------------------------------------------------
+# POST /api/voice-mode — переключить глобальный режим голоса (qa|lesson)
+# GET  /api/voice-mode — текущий режим (ридер показывает состояние)
+# Микрофон о режиме не знает: он всегда шлёт те же чанки, решает сервер.
+# ---------------------------------------------------------------------
+@app.route("/api/voice-mode", methods=["GET"])
+def handle_voice_mode_get():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"mode": _get_voice_mode()})
+
+
+@app.route("/api/voice-mode", methods=["POST"])
+def handle_voice_mode_post():
+    if not require_device_key():
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or payload.get("mode") not in VOICE_MODES:
+        keys = list(payload) if isinstance(payload, dict) else None
+        print(f"[voice-mode] 400 bad payload keys={keys}", flush=True)
+        return jsonify({"error": 'expected JSON body: {"mode": "qa"|"lesson"}'}), 400
+
+    mode = payload["mode"]
+    _set_voice_mode(mode)
+    print(f"[voice-mode] set mode={mode}", flush=True)
+    return jsonify({"ok": True, "mode": mode})
+
+
+# ---------------------------------------------------------------------
+# Режим записи урока: те же чанки, но вместо Gemini — дописывание в один WAV.
+# Одна сессия записи = один файл lessons/lesson_<дата>_<время>_<sid>.wav
+# плюс JSON-сайдкар с метаданными (пишется на финале или по TTL).
+# ---------------------------------------------------------------------
+def _get_voice_mode() -> str:
+    with _voice_mode_lock:
+        return _voice_mode
+
+
+def _set_voice_mode(mode: str):
+    global _voice_mode
+    with _voice_mode_lock:
+        _voice_mode = mode
+
+
+def _is_lesson_session(session_id: str) -> bool:
+    with _lesson_lock:
+        return session_id in _lesson_sessions
+
+
+def _sid_tail(session_id: str) -> str:
+    return session_id[-6:] if len(session_id) > 6 else session_id
+
+
+def _lesson_safe_sid(session_id: str) -> str:
+    """Хвост имени файла: только ASCII [a-zA-Z0-9_-] (защита от path traversal)."""
+    keep = "".join(
+        c for c in session_id
+        if ("a" <= c <= "z") or ("A" <= c <= "Z") or ("0" <= c <= "9") or c in "-_"
+    )
+    return (keep or "session")[:32]
+
+
+def _lesson_paths(session_id: str, started_at: float):
+    """Пути WAV и JSON-сайдкара: время в имени — время первого чанка (начало урока)."""
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(started_at))
+    base = f"lesson_{stamp}_{_lesson_safe_sid(session_id)}"
+    return (os.path.join(LESSONS_DIR, base + ".wav"),
+            os.path.join(LESSONS_DIR, base + ".json"))
+
+
+def _write_lesson_header(fh, data_size: int):
+    fh.seek(0)
+    fh.write(_wav_header(data_size))
+
+
+def _create_lesson_session_locked(session_id: str, now: float) -> dict:
+    """Создаёт WAV урока с RIFF-заголовком. OSError пробрасывается наверх (-> 500)."""
+    os.makedirs(LESSONS_DIR, exist_ok=True)
+    wav_path, json_path = _lesson_paths(session_id, now)
+    fh = open(wav_path, "w+b")
+    try:
+        _write_lesson_header(fh, 0)
+        fh.flush()
+    except OSError:
+        fh.close()
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+        raise
+    session = {
+        "sid": session_id,
+        "file": fh,
+        "path": wav_path,
+        "json_path": json_path,
+        "started_at": now,
+        "created_at": now,
+        "chunks": set(),
+        "data_bytes": 0,
+    }
+    _lesson_sessions[session_id] = session
+    print(f"[lesson] open sid_tail={_sid_tail(session_id)} "
+          f"file={os.path.basename(wav_path)}", flush=True)
+    return session
+
+
+def _append_lesson_pcm_locked(session: dict, pcm: bytes):
+    """Дописывает PCM в конец и переписывает RIFF-размер на каждом чанке.
+
+    Заголовок всегда актуален: при обрыве питания на диске остаётся валидный
+    WAV со всеми уже записанными данными, а не файл с нулевой длиной.
+    """
+    fh = session["file"]
+    new_size = session["data_bytes"] + len(pcm)
+    fh.seek(0)
+    fh.write(_wav_header(new_size))
+    fh.seek(0, os.SEEK_END)
+    fh.write(pcm)
+    fh.flush()
+    os.fsync(fh.fileno())
+    session["data_bytes"] = new_size
+
+
+def _lesson_abort_locked(session_id: str, session, err_class: str):
+    """Аварийно закрывает файл после ошибки диска: чинит заголовок, снимает сессию."""
+    _lesson_sessions.pop(session_id, None)
+    if session is None:
+        return
+    fh = session["file"]
+    try:
+        if not fh.closed:
+            _write_lesson_header(fh, session["data_bytes"])
+            fh.truncate(44 + session["data_bytes"])
+            fh.flush()
+    except OSError as e:
+        print(f"[lesson] abort repair fail sid_tail={_sid_tail(session_id)} "
+              f"err_class={type(e).__name__}", flush=True)
+    try:
+        if not fh.closed:
+            fh.close()
+    except OSError:
+        pass
+    print(f"[lesson] abort sid_tail={_sid_tail(session_id)} err_class={err_class} "
+          f"chunks={len(session['chunks'])} bytes={session['data_bytes']}", flush=True)
+
+
+def _finalize_lesson_locked(session_id: str, ended_at: float, reason: str):
+    """Закрывает WAV урока и пишет JSON-сайдкар. Возвращает сводку или None."""
+    session = _lesson_sessions.pop(session_id, None)
+    if session is None:
+        return None
+    tail = _sid_tail(session_id)
+    try:
+        session["file"].flush()
+        session["file"].close()
+    except OSError as e:
+        print(f"[lesson] close fail reason={reason} sid_tail={tail} "
+              f"err_class={type(e).__name__}", flush=True)
+    duration_sec = round(max(0.0, ended_at - session["started_at"]), 1)
+    sidecar = {
+        "sid": session["sid"],
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(session["started_at"])),
+        "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ended_at)),
+        "chunks": len(session["chunks"]),
+        "duration_sec": duration_sec,
+    }
+    sidecar_ms = 0
+    try:
+        t0 = time.monotonic()
+        with open(session["json_path"], "w", encoding="utf-8") as fh:
+            json.dump(sidecar, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        sidecar_ms = int((time.monotonic() - t0) * 1000)
+    except OSError as e:
+        print(f"[lesson] sidecar fail reason={reason} sid_tail={tail} "
+              f"err_class={type(e).__name__}", flush=True)
+    print(f"[lesson] finalize reason={reason} sid_tail={tail} chunks={sidecar['chunks']} "
+          f"bytes={session['data_bytes']} duration_sec={duration_sec} "
+          f"ms={sidecar_ms} file={os.path.basename(session['path'])}", flush=True)
+    return session
+
+
+def _sweep_lesson_sessions_locked(now: float) -> int:
+    """Просроченные записи закрываем и дописываем им JSON (общий TTL голосовых сессий)."""
+    expired = [sid for sid, s in _lesson_sessions.items()
+               if now - s["created_at"] > VOICE_SESSION_TTL]
+    for sid in expired:
+        _finalize_lesson_locked(sid, now, reason="ttl")
+    if expired:
+        print(f"[lesson] evict n={len(expired)} ttl={VOICE_SESSION_TTL}", flush=True)
+    return len(expired)
+
+
+def _handle_lesson_chunk(session_id: str, sid_tail: str, chunk_index: int,
+                         is_final: bool, audio_bytes: bytes):
+    """Ветка mode=lesson: только запись на диск — Gemini/Groq не вызываются никогда."""
+    now = time.time()
+    pcm = b""
+    if audio_bytes:
+        try:
+            pcm = audio_bytes[_wav_data_offset(audio_bytes):]
+        except RuntimeError as e:
+            print(f"[lesson] 400 bad chunk sid_tail={sid_tail} err={e}", flush=True)
+            return jsonify({"error": f"failed to record chunk: {e}"}), 400
+
+    with _lesson_lock:
+        _sweep_lesson_sessions_locked(now)
+        session = _lesson_sessions.get(session_id)
+        if session is None and is_final and not pcm:
+            # Пустой финальный маркер без начатой записи: сохранять нечего.
+            print(f"[lesson] 400 empty final sid_tail={sid_tail}", flush=True)
+            return jsonify({"error": "empty lesson session"}), 400
+
+        try:
+            if session is None:
+                if len(_lesson_sessions) >= VOICE_MAX_SESSIONS:
+                    print(f"[lesson] 413 sessions={len(_lesson_sessions)} "
+                          f"cap={VOICE_MAX_SESSIONS} sid_tail={sid_tail}", flush=True)
+                    return jsonify({"error": "too many sessions"}), 413
+                session = _create_lesson_session_locked(session_id, now)
+
+            if chunk_index not in session["chunks"] and len(session["chunks"]) >= LESSON_MAX_CHUNKS:
+                # Лимит урока: записанное не выбрасываем — финализируем и отпускаем сессию.
+                n = len(session["chunks"])
+                _finalize_lesson_locked(session_id, now, reason="cap")
+                print(f"[lesson] 413 sid_tail={sid_tail} chunks={n} "
+                      f"cap={LESSON_MAX_CHUNKS}", flush=True)
+                return jsonify({"error": "too many chunks, session reset"}), 413
+
+            if pcm:
+                if chunk_index in session["chunks"]:
+                    print(f"[lesson] warn sid_tail={sid_tail} duplicate idx={chunk_index} skip", flush=True)
+                else:
+                    t0 = time.monotonic()
+                    _append_lesson_pcm_locked(session, pcm)
+                    append_ms = int((time.monotonic() - t0) * 1000)
+                    session["chunks"].add(chunk_index)
+                    # TTL считается от последнего чанка: урок длиннее TTL не рвётся посередине.
+                    session["created_at"] = now
+                    print(f"[lesson] chunk sid_tail={sid_tail} idx={chunk_index} "
+                          f"pcm_bytes={len(pcm)} total_bytes={session['data_bytes']} "
+                          f"ms={append_ms}", flush=True)
+        except OSError as e:
+            _lesson_abort_locked(session_id, session, type(e).__name__)
+            print(f"[lesson] fail sid_tail={sid_tail} err_class={type(e).__name__} "
+                  f"err={e} status=500", flush=True)
+            return jsonify({"error": "lesson write failed"}), 500
+
+        chunks = len(session["chunks"])
+        if not is_final:
+            return jsonify({"ok": True, "chunks_received": chunks})
+
+        _finalize_lesson_locked(session_id, time.time(), reason="final")
+
+    return jsonify({"ok": True, "final": True, "mode": VOICE_MODE_LESSON,
+                    "lesson_chunks": chunks})
+
+
+# ---------------------------------------------------------------------
 # POST /api/voice-chunk — принимает WAV-чанки записи по 5 секунд от ESP32-C3
 # Заголовки:
 #   X-Session-Id:   уникальный ID сессии (одна сессия = одна запись целиком)
@@ -581,6 +864,12 @@ def handle_voice_chunk():
         return jsonify({"error": "empty body, expected raw WAV bytes"}), 400
 
     print(f"[voice] chunk sid_tail={sid_tail} idx={chunk_index} bytes={len(audio_bytes)} final={is_final}", flush=True)
+
+    # Режим записи урока: микрофон всегда шлёт те же чанки, сервер сам решает,
+    # что с ними делать. Начатую lesson-сессию доводим до финала, даже если
+    # режим успели переключить — иначе чанки одной записи разъедутся по двум путям.
+    if _get_voice_mode() == VOICE_MODE_LESSON or _is_lesson_session(session_id):
+        return _handle_lesson_chunk(session_id, sid_tail, chunk_index, is_final, audio_bytes)
 
     # Очистка просроченных сессий (чтобы память не текла)
     now = time.time()
@@ -806,8 +1095,15 @@ def get_photo_status():
     with _state_lock:
         answer_ready = _honest_answer_ready_locked()
     voice_busy = _get_voice_busy()
+    voice_mode = _get_voice_mode()
+    with _lesson_lock:
+        # Активная запись урока одна; если её нет — 0 записанных чанков.
+        lesson_chunks = max((len(s["chunks"]) for s in _lesson_sessions.values()), default=0)
 
-    response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready, "voice_busy": voice_busy},
+    # Новые ключи в конце: старый парсер microReader их просто игнорирует.
+    response_text = json.dumps({"staged": staged, "photo_status": status, "answer_ready": answer_ready,
+                                "voice_busy": voice_busy, "voice_mode": voice_mode,
+                                "lesson_chunks": lesson_chunks},
                                ensure_ascii=False, separators=(",", ":"))
     return Response(response_text, mimetype='application/json')
 
@@ -837,6 +1133,7 @@ if __name__ == "__main__":
           f"groq_lang={GROQ_STT_LANGUAGE} max_content_length={MAX_CONTENT_LENGTH} "
           f"photo_max_bytes={PHOTO_MAX_BYTES} voice_max_bytes={VOICE_MAX_BYTES} "
           f"voice_max_sessions={VOICE_MAX_SESSIONS} voice_max_chunks={VOICE_MAX_CHUNKS} "
+          f"lesson_max_chunks={LESSON_MAX_CHUNKS} lessons_dir={LESSONS_DIR} "
           f"voice_chunk_max_bytes={VOICE_CHUNK_MAX_BYTES} voice_session_ttl={VOICE_SESSION_TTL} "
           f"photo_frame_max_bytes={PHOTO_FRAME_MAX_BYTES} photos_max_images={PHOTOS_MAX_IMAGES} "
           f"photos_max_total_b64={PHOTOS_MAX_TOTAL_B64} photo_staging_cap={PHOTO_STAGING_CAP} "
