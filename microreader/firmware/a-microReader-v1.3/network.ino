@@ -233,8 +233,10 @@ bool fetchPhotoStatus(int &staged, String &photoStatus, bool &answerReady) {
     return fetchPhotoStatus(staged, photoStatus, answerReady, dummyBusy, dummyChunks);
 }
 
-// GET /api/voice-mode -> mode ("qa"/"lesson"), true при HTTP 200.
-// Нет ключа mode в ответе -> "qa". Молча: экран рисует вызывающий код.
+// GET /api/voice-mode -> mode ("qa"/"lesson").
+// true только при HTTP 200 И точном значении "qa"/"lesson" в ответе.
+// Иначе mode НЕ меняется: неизвестный режим не подменяется догадкой.
+// Молча: экран рисует вызывающий код.
 bool fetchVoiceMode(String &mode) {
     WiFiClient client;
     HTTPClient http;
@@ -247,29 +249,32 @@ bool fetchVoiceMode(String &mode) {
     http.setTimeout(10000);
 
     int httpCode = http.GET();
-    String parsed = "qa";  // нет ключа mode в ответе -> "qa"
-    bool ok = (httpCode == 200);
+    bool ok = false;
 
-    if (ok) {
+    if (httpCode == 200) {
         String response = http.getString();
         int pMode = response.indexOf("\"mode\":\"");
         if (pMode >= 0) {
             int vStart = pMode + 8;  // длина "mode":"
             int vEnd = response.indexOf("\"", vStart);
             if (vEnd > vStart) {
-                String m = response.substring(vStart, vEnd);
-                if (m == "qa" || m == "lesson") parsed = m;
+                String parsed = response.substring(vStart, vEnd);
+                if (parsed == "qa" || parsed == "lesson") {
+                    mode = parsed;
+                    ok = true;
+                }
             }
         }
-        mode = parsed;  // при ошибке оставляем прежнее значение
     }
 
     http.end();
     return ok;
 }
 
-// POST /api/voice-mode {"mode":"qa"|"lesson"}, true при HTTP 200.
-bool postVoiceMode(const String &mode) {
+// POST /api/voice-mode {"mode":"qa"|"lesson"}.
+// true только если HTTP 200 И сервер подтвердил режим в теле ответа
+// ({"ok":true,"mode":"..."}); confirmed = подтверждённое значение.
+bool postVoiceMode(const String &mode, String &confirmed) {
     WiFiClient client;
     HTTPClient http;
     String url;
@@ -285,9 +290,26 @@ bool postVoiceMode(const String &mode) {
     http.setTimeout(10000);
 
     int httpCode = http.POST(body);
+    bool ok = false;
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        int pMode = response.indexOf("\"mode\":\"");
+        if (pMode >= 0) {
+            int vStart = pMode + 8;  // длина "mode":"
+            int vEnd = response.indexOf("\"", vStart);
+            if (vEnd > vStart) {
+                String parsed = response.substring(vStart, vEnd);
+                if (parsed == "qa" || parsed == "lesson") {
+                    confirmed = parsed;
+                    ok = true;
+                }
+            }
+        }
+    }
 
     http.end();
-    return httpCode == 200;
+    return ok;
 }
 
 // Окно статуса фото: 4 строки.

@@ -11,6 +11,7 @@ bool ansExitToMain = false;  // Меню 3 просит Меню 2 сразу в
 String monLines[3];          // живые строки состояния Меню 3
 int monLineCount = 0;
 String voiceMode = "qa";     // режим сервера: "qa" (вопрос-ответ) | "lesson" (урок)
+bool voiceModeKnown = false;  // true только после подтверждения сервером (GET/POST)
 
 // Список /answer_*.txt, сортировка по номеру: НОВЫЕ -> СТАРЫЕ.
 void ansRebuildList() {
@@ -83,7 +84,8 @@ void ansDrawMonitor(int ansCursor, bool monitoring) {
       if (monitoring) oled.print(F("Мониторинг: ВКЛ"));
       else oled.print(F("Мониторинг: ВЫКЛ"));
     } else if (r == 1) {
-      if (voiceMode == "lesson") oled.print(F("Режим: Урок"));
+      if (!voiceModeKnown) oled.print(F("Режим: ...?"));
+      else if (voiceMode == "lesson") oled.print(F("Режим: Урок"));
       else oled.print(F("Режим: Вопросы"));
     } else {
       oled.print(monLines[r - 2]);
@@ -111,7 +113,7 @@ bool ansPollMonitor(bool &monReady) {
   if (!fetchPhotoStatus(staged, photoStatus, answerReady, voiceBusy, lessonChunks)) {
     return false;
   }
-  fetchVoiceMode(voiceMode);  // строка режима всегда показывает состояние сервера
+  if (fetchVoiceMode(voiceMode)) voiceModeKnown = true;  // при ошибке — прежний режим и прежний флаг
   monReady = answerReady;
   monLineCount = 0;
   monLines[monLineCount].reserve(32);  // пресайз: меньше переаллокаций кучи на ESP8266
@@ -129,6 +131,7 @@ void enterMonitorMenu() {
   ansExitToMain = false;
   bool monitoring = false;
   bool monReady = false;
+  voiceModeKnown = false;  // вход в меню: режим подтверждается только свежим опросом
   int ansCursor = 0;
   unsigned long enterTime = millis();
   unsigned long lastPoll = 0;
@@ -176,14 +179,23 @@ void enterMonitorMenu() {
           monLines[0] = "включи мониторинг";
           ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
           ansDrawMonitor(ansCursor, monitoring);
+        } else if (!voiceModeKnown) {
+          // Режим не подтверждён сервером: переключать нечего, ждём удачный опрос
+          monReady = false;
+          monLineCount = 1;
+          monLines[0] = "нет данных о режиме";
+          ansCursor = constrain(ansCursor, 0, 1 + monLineCount);
+          ansDrawMonitor(ansCursor, monitoring);
         } else {
           String want = (voiceMode == "lesson") ? "qa" : "lesson";
           oled.clear(); oled.home();
           oled.println("Режим:");
           oled.print(want == "lesson" ? "Урок" : "Вопрос-ответ");
           oled.update();
-          if (postVoiceMode(want)) {
-            voiceMode = want;  // строка режима обновляется сразу
+          String confirmed = "";
+          if (postVoiceMode(want, confirmed)) {
+            voiceMode = confirmed;  // доверяем только ответу сервера
+            voiceModeKnown = true;
             if (!ansPollMonitor(monReady)) {
               monReady = false;
               monLineCount = 1;
@@ -273,6 +285,7 @@ void enterMonitorMenu() {
         } else {
           monitoring = false;
           monReady = false;
+          voiceModeKnown = false;  // знание устарело: сервер мог перезапуститься
           WiFi.mode(WIFI_OFF);
           monLineCount = 1;
           monLines[0] = "выключено";
